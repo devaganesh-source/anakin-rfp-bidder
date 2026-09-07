@@ -1,20 +1,37 @@
-"""Read RFPs through Anakin Crawl; failures require manual intervention."""
+"""Crawl RFPs and stage drafts on our local mock portal, without approving them.
+
+Load .env in the application entry point. ANAKIN_API_KEY and MOCK_PORTAL_URL
+are required; the latter must be the loopback mock server's root URL.
+Browser Sessions' documented programmatic interface is CDP over WebSocket:
+https://anakin.io/docs/api-reference/browser-sessions
+https://anakin.io/docs/api-reference/browser-api
+"""
 
 import asyncio
+import base64
+import ipaddress
 import json
 import os
 import re
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 
 
 CRAWL_API_URL = "https://api.anakin.io/v1/crawl"
+BROWSER_API_URL = "wss://api.anakin.io/v1/browser-connect"
 REQUEST_TIMEOUT_SECONDS = 30
 CRAWL_TIMEOUT_SECONDS = 120
 MAX_POLLS = 20
 POLL_INTERVAL_SECONDS = 2
+STAGING_TIMEOUT_SECONDS = 180
+MAX_FORM_BYTES = 128_000
+FORM_FIELDS = (
+    ("Security", "security", "security"),
+    ("Tech Specs", "tech_specs", "tech-specs"),
+    ("Pricing", "pricing", "pricing"),
+)
 
 
 class AnakinCrawlError(RuntimeError):
@@ -22,6 +39,25 @@ class AnakinCrawlError(RuntimeError):
 
     def __init__(self, message: str) -> None:
         super().__init__(f"{message} Manual intervention required.")
+
+
+class AnakinStageError(RuntimeError):
+    """Staging stopped; any partially saved draft needs manual review."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{message} Manual intervention required; do not auto-retry staging.")
+
+
+def _environment_key(supplied: str) -> str:
+    """Keep the explicit argument compatible while requiring an environment key."""
+    key = os.environ.get("ANAKIN_API_KEY", "").strip()
+    if not key or not isinstance(supplied, str):
+        raise ValueError("Set ANAKIN_API_KEY in the environment before calling this client.")
+    if supplied and supplied.strip() != key:
+        raise ValueError("anakin_api_key must match ANAKIN_API_KEY in the environment.")
+    if any(character.isspace() for character in key):
+        raise ValueError("ANAKIN_API_KEY must not contain whitespace.")
+    return key
 
 
 def _split_markdown_sections(markdown: str) -> dict[str, str]:
@@ -136,10 +172,10 @@ def _extract_markdown(result: dict[str, Any]) -> str:
     return "\n\n".join(documents)
 
 
-async def crawl_rfp(url: str, anakin_api_key: str) -> dict[str, str]:
+async def crawl_rfp(url: str, anakin_api_key: str = "") -> dict[str, str]:
     """Submit a one-page crawl, poll within fixed limits, and return sections.
 
-    Pass the API key from os.environ['ANAKIN_API_KEY']; it is never logged.
+    The key is read from ANAKIN_API_KEY; an explicit key must match it.
     ANAKIN_CRAWL_API_URL may override the API endpoint for a local mock.
     Invalid arguments raise ValueError. HTTP, timeout, job, and response
     failures raise AnakinCrawlError; failed requests are never retried.
@@ -147,17 +183,18 @@ async def crawl_rfp(url: str, anakin_api_key: str) -> dict[str, str]:
     parsed_url = urlsplit(url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
         raise ValueError("RFP URL must be an absolute HTTP or HTTPS URL.")
-    if not anakin_api_key.strip():
-        raise ValueError("Provide ANAKIN_API_KEY from the environment.")
+    key = _environment_key(anakin_api_key)
 
     endpoint = os.environ.get("ANAKIN_CRAWL_API_URL", CRAWL_API_URL).rstrip("/")
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(
+        total=REQUEST_TIMEOUT_SECONDS, connect=10, sock_read=REQUEST_TIMEOUT_SECONDS
+    )
     # Each invocation has its own session. Polls run sequentially and sleep
     # cooperatively, so callers may run separate crawls concurrently; no lock is used.
     try:
         async with asyncio.timeout(CRAWL_TIMEOUT_SECONDS):
             async with aiohttp.ClientSession(
-                headers={"X-API-Key": anakin_api_key}, timeout=timeout
+                headers={"X-API-Key": key}, timeout=timeout
             ) as session:
                 result = await _request_json(
                     session, "POST", endpoint, {"url": url, "maxPages": 1}
@@ -183,3 +220,322 @@ async def crawl_rfp(url: str, anakin_api_key: str) -> dict[str, str]:
         raise AnakinCrawlError("The crawl exceeded its overall time limit.") from exc
 
     raise AnakinCrawlError("The crawl did not finish within the polling limit.")
+
+
+def _mock_origin(portal_url: str) -> str:
+    """Require the configured loopback server, with no alternate navigation URL."""
+    def normalize(value: str) -> str:
+        if not isinstance(value, str) or any(c.isspace() for c in value) or "\\" in value:
+            raise ValueError("MOCK_PORTAL_URL must be a loopback HTTP(S) root URL.")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+        ):
+            raise ValueError("MOCK_PORTAL_URL must be a loopback HTTP(S) root URL.")
+        host = parsed.hostname
+        if host != "localhost":
+            try:
+                local = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local = False
+            if not local:
+                raise ValueError("Browser staging is restricted to the local mock portal.")
+        default_port = 443 if parsed.scheme == "https" else 80
+        port = parsed.port or default_port
+        if ":" in host:
+            host = f"[{host}]"
+        suffix = f":{port}" if port != default_port else ""
+        return f"{parsed.scheme}://{host}{suffix}"
+
+    configured = normalize(os.environ.get("MOCK_PORTAL_URL", ""))
+    if normalize(portal_url) != configured:
+        raise ValueError("portal_url must match MOCK_PORTAL_URL in the environment.")
+    return configured
+
+
+def _validated_answers(answers: list) -> dict[str, str]:
+    """Accept the reasoner's section/answer objects; selectors are never generated."""
+    expected = {title for title, _, _ in FORM_FIELDS}
+    values: dict[str, str] = {}
+    if not isinstance(answers, list):
+        raise ValueError("answers must be a list of section/answer objects.")
+    for item in answers:
+        if not isinstance(item, dict) or not isinstance(item.get("section"), str):
+            raise ValueError("Each answer must contain a section and an answer string.")
+        title, answer = item["section"], item.get("answer")
+        if title not in expected or title in values:
+            raise ValueError("Provide each mock portal section exactly once.")
+        if not isinstance(answer, str) or not 1 <= len(answer.strip()) <= 10_000:
+            raise ValueError("Each answer must contain 1 to 10000 characters.")
+        # The mock portal strips surrounding whitespace when saving each section.
+        values[title] = answer.strip().replace("\r\n", "\n").replace("\r", "\n")
+    if set(values) != expected:
+        raise ValueError("Security, Tech Specs, and Pricing answers are all required.")
+    return values
+
+
+class _MockBrowser:
+    """Sequential CDP commands with a strictly scoped local HTTP relay.
+
+    Fetch interception supplies local HTML to Anakin's remote browser. No
+    browser request is continued onto the network. The separate HTTP session
+    never receives the Anakin key. Only this draft's next form route is relayed.
+    """
+
+    def __init__(self, websocket, portal_session: aiohttp.ClientSession, origin: str):
+        self.websocket = websocket
+        self.portal_session = portal_session
+        self.origin = origin
+        self.session_id: str | None = None
+        self.bid_id: str | None = None
+        self.next_request: tuple[str, str] | None = ("GET", "/")
+        self.sequence = 0
+        self.replies: dict[int, dict] = {}
+        self.controls: set[int] = set()
+        self.frame: dict = {}
+        self.loaded: set[tuple[str, str]] = set()
+
+    async def _send(self, method: str, params: dict) -> int:
+        # One staging task owns the socket, so sends and response reads never race.
+        self.sequence += 1
+        message = {"id": self.sequence, "method": method, "params": params}
+        if self.session_id:
+            message["sessionId"] = self.session_id
+        await self.websocket.send_json(message)
+        return self.sequence
+
+    async def _receive(self) -> None:
+        # Events are serviced while commands wait; there is no background submitter.
+        message = await self.websocket.receive()
+        if message.type != aiohttp.WSMsgType.TEXT:
+            raise AnakinStageError("The Anakin browser connection closed unexpectedly.")
+        event = json.loads(message.data)
+        if not isinstance(event, dict):
+            raise AnakinStageError("The browser returned malformed CDP data.")
+        if "id" in event:
+            if "error" in event:
+                raise AnakinStageError("Anakin rejected a browser command.")
+            if event["id"] in self.controls:
+                self.controls.remove(event["id"])
+            else:
+                self.replies[event["id"]] = event.get("result", {})
+            return
+        if event.get("sessionId") != self.session_id:
+            return
+        params = event.get("params", {})
+        if event.get("method") == "Fetch.requestPaused":
+            result = await self._relay(params["request"])
+            command_id = await self._send(
+                "Fetch.fulfillRequest", {"requestId": params["requestId"], **result}
+            )
+            self.controls.add(command_id)
+        elif event.get("method") == "Page.frameNavigated":
+            if "parentId" not in params["frame"]:
+                self.frame = params["frame"]
+        elif event.get("method") == "Page.lifecycleEvent" and params.get("name") == "load":
+            self.loaded.add((params["frameId"], params["loaderId"]))
+
+    async def call(self, method: str, params: dict | None = None) -> dict:
+        # The deadline includes event handling and relay I/O; errors are not retried.
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+                command_id = await self._send(method, params or {})
+                while command_id not in self.replies or self.controls:
+                    await self._receive()
+                return self.replies.pop(command_id)
+        except asyncio.TimeoutError:
+            raise AnakinStageError("A browser command timed out.") from None
+        except (aiohttp.ClientError, OSError, ValueError, KeyError, TypeError):
+            raise AnakinStageError("Browser communication failed or returned invalid data.") from None
+
+    async def wait_page(self, url: str) -> None:
+        # Lifecycle events identify the committed document; no sleeps or action retries.
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+                while (
+                    self.frame.get("url") != url
+                    or (self.frame.get("id"), self.frame.get("loaderId")) not in self.loaded
+                    or self.controls
+                ):
+                    await self._receive()
+        except asyncio.TimeoutError:
+            raise AnakinStageError("The mock portal did not finish navigation.") from None
+        except (aiohttp.ClientError, OSError, ValueError, KeyError, TypeError):
+            raise AnakinStageError("Browser navigation failed or returned invalid data.") from None
+
+    async def evaluate(self, expression: str) -> Any:
+        # Evaluation is sequential; answer text is JSON data inside fixed scripts.
+        result = await self.call("Runtime.evaluate", {
+            "expression": expression, "returnByValue": True,
+            "timeout": REQUEST_TIMEOUT_SECONDS * 1000,
+        })
+        if "exceptionDetails" in result or not isinstance(result.get("result"), dict):
+            raise AnakinStageError("The mock portal does not match the expected form.")
+        return result["result"].get("value")
+
+    async def _relay(self, request: dict) -> dict:
+        # Requests are forwarded serially with no credentials and no redirect following.
+        url, method = request["url"], request["method"]
+        if url == self.origin + "/favicon.ico" and method == "GET":
+            return {"responseCode": 204, "body": ""}
+        if self.next_request is None:
+            raise AnakinStageError("Blocked a request after the draft reached review.")
+        expected_method, path = self.next_request
+        if method != expected_method or url != self.origin + path:
+            raise AnakinStageError("Blocked a request outside the mock staging workflow.")
+        body = request.get("postData", "")
+        if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_FORM_BYTES:
+            raise AnakinStageError("The browser supplied invalid or oversized form data.")
+        if method == "POST" and path != "/bids" and not body:
+            raise AnakinStageError("The browser omitted the form body.")
+        try:
+            async with self.portal_session.request(
+                method, url, data=body.encode("utf-8") if method == "POST" else None,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=10),
+                allow_redirects=False,
+            ) as response:
+                if response.status != (303 if method == "POST" else 200):
+                    raise AnakinStageError(f"The mock portal returned HTTP {response.status}.")
+                content = await response.read()
+                if method == "POST":
+                    destination = urljoin(url, response.headers.get("Location", ""))
+                    if path == "/bids":
+                        match = re.fullmatch(
+                            re.escape(self.origin) + r"/bids/([0-9a-f]{32})/security", destination
+                        )
+                        if not match:
+                            raise AnakinStageError("The mock portal returned an unsafe draft redirect.")
+                        self.bid_id = match[1]
+                        next_path = f"/bids/{self.bid_id}/security"
+                    else:
+                        next_slug = {"security": "tech-specs", "tech-specs": "pricing", "pricing": "submit"}
+                        next_path = f"/bids/{self.bid_id}/{next_slug[path.rsplit('/', 1)[1]]}"
+                    if destination != self.origin + next_path:
+                        raise AnakinStageError("The mock portal redirected outside the next section.")
+                    self.next_request = ("GET", next_path)
+                else:
+                    self.next_request = (
+                        None if path.endswith("/submit") else ("POST", "/bids" if path == "/" else path)
+                    )
+                headers = [
+                    {"name": name, "value": value}
+                    for name, value in response.headers.items()
+                    if name.lower() in {"content-type", "location", "content-security-policy", "cache-control"}
+                ]
+                return {
+                    "responseCode": response.status, "responseHeaders": headers,
+                    "body": base64.b64encode(content).decode("ascii"),
+                }
+        except asyncio.TimeoutError:
+            raise AnakinStageError("The local mock portal request timed out.") from None
+        except aiohttp.ClientError:
+            raise AnakinStageError("Could not reach the local mock portal.") from None
+
+
+async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> dict[str, Any]:
+    """Save each known section, then verify the locked review page."""
+    # Saves run in order because each form carries the draft's current revision.
+    navigation = await browser.call("Page.navigate", {"url": browser.origin + "/"})
+    if navigation.get("errorText") or navigation.get("isDownload"):
+        raise AnakinStageError("The browser could not navigate to the mock portal.")
+    await browser.wait_page(browser.origin + "/")
+    await browser.evaluate("""(() => {
+        const button = document.getElementById('start_bid');
+        if (!button || button.disabled || button.form?.getAttribute('action') !== '/bids'
+            || button.form.method !== 'post') throw new Error('Unexpected start form');
+        button.click();
+    })()""")
+    # The first navigation creates the draft; its ID comes only from the checked redirect.
+    async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+        while browser.bid_id is None:
+            await browser._receive()
+    for title, field_id, slug in FORM_FIELDS:
+        page_url = f"{browser.origin}/bids/{browser.bid_id}/{slug}"
+        await browser.wait_page(page_url)
+        data = json.dumps({"url": page_url, "id": field_id, "title": title, "answer": answers[title]})
+        await browser.evaluate("""((data) => {
+            const field = document.getElementById(data.id);
+            const button = document.getElementById('save_continue');
+            if (location.href !== data.url || !(field instanceof HTMLTextAreaElement)
+                || field.name !== data.title || field.disabled || field.readOnly
+                || !button || button.disabled || button.form !== field.form
+                || field.form.action !== data.url || field.form.method !== 'post')
+                throw new Error('Unexpected section form');
+            field.value = data.answer;
+            if (field.value !== data.answer || !field.form.reportValidity())
+                throw new Error('Invalid answer');
+            button.click();
+        })(""" + data + ")")
+    review_url = f"{browser.origin}/bids/{browser.bid_id}/submit"
+    await browser.wait_page(review_url)
+    expected = json.dumps({f"review_{field}": answers[title] for title, field, _ in FORM_FIELDS})
+    verified = await browser.evaluate("""((expected) => {
+        const submit = document.getElementById('submit_bid');
+        return !!submit && submit.disabled && submit.form.action === location.href
+            && !!document.getElementById('approve_bid')
+            && Object.entries(expected).every(([id, answer]) =>
+                document.getElementById(id)?.textContent === answer);
+    })(""" + expected + ")")
+    if verified is not True:
+        raise AnakinStageError("The saved answers or human approval gate could not be verified.")
+    return {
+        "bid_id": browser.bid_id, "review_url": review_url,
+        "status": "awaiting_approval", "submitted": False,
+    }
+
+
+async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") -> dict[str, Any]:
+    """Launch Anakin's browser, fill the local draft, and stop at locked review.
+
+    Answers use {"section": "Security" | "Tech Specs" | "Pricing", "answer": str};
+    source_snippet from the reasoner is accepted but never treated as an action.
+    The key comes from ANAKIN_API_KEY; an explicit argument must match it.
+    portal_url must match the loopback root in MOCK_PORTAL_URL.
+
+    CDP Fetch relays only the next mock form request through a separate local
+    aiohttp session, so cloud-browser localhost connectivity is unnecessary.
+    The server persists each answer. The browser disconnects after verification;
+    review_url reopens that draft for a human. This function neither approves
+    nor submits. The portal's /api/bids/{id}/approve gate remains mandatory.
+
+    Invalid input raises ValueError before network I/O. Operational failures
+    raise AnakinStageError and may leave a partial draft; never retry blindly.
+    """
+    origin = _mock_origin(portal_url)
+    values = _validated_answers(answers)
+    key = _environment_key(anakin_api_key)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=10)
+    # Calls own separate sessions. Within a bid, all actions are sequential;
+    # the portal's asyncio.Event blocks final submission until explicit human approval.
+    try:
+        async with asyncio.timeout(STAGING_TIMEOUT_SECONDS):
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as api_session,
+                aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.DummyCookieJar()) as local,
+            ):
+                async with api_session.ws_connect(
+                    BROWSER_API_URL, headers={"X-API-Key": key},
+                    timeout=aiohttp.ClientWSTimeout(ws_receive=REQUEST_TIMEOUT_SECONDS, ws_close=5),
+                    max_msg_size=2 * 1024 * 1024,
+                ) as websocket:
+                    browser = _MockBrowser(websocket, local, origin)
+                    target = await browser.call("Target.createTarget", {"url": "about:blank"})
+                    attached = await browser.call("Target.attachToTarget", {
+                        "targetId": target["targetId"], "flatten": True,
+                    })
+                    browser.session_id = attached["sessionId"]
+                    await browser.call("Page.enable")
+                    await browser.call("Page.setLifecycleEventsEnabled", {"enabled": True})
+                    await browser.call("Fetch.enable")
+                    return await _fill_mock_forms(browser, values)
+    except asyncio.TimeoutError:
+        raise AnakinStageError("Staging exceeded its time limit.") from None
+    except aiohttp.ClientResponseError as exc:
+        raise AnakinStageError(f"Anakin browser connection returned HTTP {exc.status}.") from None
+    except (aiohttp.ClientError, OSError):
+        raise AnakinStageError("The Anakin browser connection failed.") from None
+    except (ValueError, KeyError, TypeError):
+        raise AnakinStageError("Anakin returned malformed browser data.") from None
