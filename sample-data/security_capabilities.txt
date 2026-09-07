@@ -1,0 +1,4 @@
+﻿Security and Compliance:
+Our platform is SOC2 Type II compliant and encrypts all data at rest using AES-256. 
+We provide 24/7 support with a guaranteed 1-hour response time for critical issues. 
+User authentication integrates seamlessly with single sign-on (SSO) via SAML 2.0.

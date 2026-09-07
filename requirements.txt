@@ -1,0 +1,8 @@
+﻿fastapi
+uvicorn
+groq
+aiohttp
+faiss-cpu
+sentence-transformers
+pydantic
+python-dotenv
