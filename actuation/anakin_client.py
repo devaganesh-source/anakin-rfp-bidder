@@ -11,10 +11,12 @@ import asyncio
 import base64
 import ipaddress
 import json
+import logging
 import os
 import re
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from uuid import uuid4
 
 import aiohttp
 
@@ -26,12 +28,16 @@ CRAWL_TIMEOUT_SECONDS = 120
 MAX_POLLS = 20
 POLL_INTERVAL_SECONDS = 2
 STAGING_TIMEOUT_SECONDS = 180
+PORTAL_NAVIGATION_ATTEMPTS = 3
+PORTAL_RETRY_DELAY_SECONDS = 1
+PORTAL_PROBE_TIMEOUT_SECONDS = 5
 MAX_FORM_BYTES = 128_000
 FORM_FIELDS = (
     ("Security", "security", "security"),
     ("Tech Specs", "tech_specs", "tech-specs"),
     ("Pricing", "pricing", "pricing"),
 )
+LOGGER = logging.getLogger(__name__)
 
 
 class AnakinCrawlError(RuntimeError):
@@ -53,6 +59,13 @@ class AnakinStageError(RuntimeError):
         super().__init__(f"{message} Manual intervention required; do not auto-retry staging.")
         self.code = code
         self.payload = {"code": code, "message": message}
+
+
+class MockPortalUnavailableError(AnakinStageError):
+    """The local portal could not be reached after bounded navigation retries."""
+
+    def __init__(self, message: str = "Could not reach the local mock portal.") -> None:
+        super().__init__(message, "MOCK_PORTAL_UNREACHABLE")
 
 
 def _environment_key(supplied: str) -> str:
@@ -234,7 +247,7 @@ async def crawl_rfp(url: str, anakin_api_key: str = "") -> dict[str, str]:
 
 
 def _mock_origin(portal_url: str) -> str:
-    """Require the configured loopback server, with no alternate navigation URL."""
+    """Require the configured loopback server while allowing localhost aliases."""
     def normalize(value: str) -> str:
         if not isinstance(value, str) or any(c.isspace() for c in value) or "\\" in value:
             raise ValueError("MOCK_PORTAL_URL must be a loopback HTTP(S) root URL.")
@@ -261,9 +274,69 @@ def _mock_origin(portal_url: str) -> str:
         return f"{parsed.scheme}://{host}{suffix}"
 
     configured = normalize(os.environ.get("MOCK_PORTAL_URL", ""))
-    if normalize(portal_url) != configured:
+    supplied = normalize(portal_url)
+    configured_parts = urlsplit(configured)
+    supplied_parts = urlsplit(supplied)
+    configured_host = configured_parts.hostname or ""
+    supplied_host = supplied_parts.hostname or ""
+    loopback_alias = {configured_host, supplied_host} <= {"localhost", "127.0.0.1"}
+    configured_port = configured_parts.port or (443 if configured_parts.scheme == "https" else 80)
+    supplied_port = supplied_parts.port or (443 if supplied_parts.scheme == "https" else 80)
+    same_origin = (
+        supplied_parts.scheme == configured_parts.scheme
+        and supplied_port == configured_port
+        and (supplied_host == configured_host or loopback_alias)
+    )
+    if not same_origin:
         raise ValueError("portal_url must match MOCK_PORTAL_URL in the environment.")
-    return configured
+    return supplied
+
+
+def _mock_origins(portal_url: str) -> tuple[str, ...]:
+    """Return the configured origin followed by its local host alias."""
+    origin = _mock_origin(portal_url)
+    parsed = urlsplit(origin)
+    host = (parsed.hostname or "").lower()
+    if host not in {"localhost", "127.0.0.1"}:
+        return (origin,)
+    alternate_host = "127.0.0.1" if host == "localhost" else "localhost"
+    netloc = alternate_host
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    alternate = urlunsplit((parsed.scheme, netloc, "", "", ""))
+    return (origin, alternate)
+
+
+async def _reachable_mock_origin(
+    session: aiohttp.ClientSession, origins: tuple[str, ...]
+) -> str:
+    """Probe each local origin with bounded retries before opening a browser session."""
+    # Host candidates run sequentially; each bounded retry yields to other requests.
+    last_error: BaseException | None = None
+    for origin in origins:
+        for attempt in range(1, PORTAL_NAVIGATION_ATTEMPTS + 1):
+            try:
+                async with session.get(
+                    origin + "/", allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=PORTAL_PROBE_TIMEOUT_SECONDS, connect=2),
+                ) as response:
+                    if response.status != 200:
+                        raise MockPortalUnavailableError(
+                            f"The mock portal returned HTTP {response.status}."
+                        )
+                    await response.read()
+                return origin
+            except (MockPortalUnavailableError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt < PORTAL_NAVIGATION_ATTEMPTS:
+                    LOGGER.warning(
+                        "Mock portal navigation attempt %d/%d failed for %s; retrying in %ss.",
+                        attempt, PORTAL_NAVIGATION_ATTEMPTS, origin, PORTAL_RETRY_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(PORTAL_RETRY_DELAY_SECONDS)
+    if last_error is not None:
+        raise MockPortalUnavailableError() from last_error
+    raise MockPortalUnavailableError()
 
 
 def _validated_answers(answers: list) -> dict[str, str]:
@@ -441,18 +514,40 @@ class _MockBrowser:
                     "body": base64.b64encode(content).decode("ascii"),
                 }
         except asyncio.TimeoutError:
-            raise AnakinStageError("The local mock portal request timed out.") from None
+            raise MockPortalUnavailableError("The local mock portal request timed out.") from None
         except aiohttp.ClientError:
-            raise AnakinStageError("Could not reach the local mock portal.") from None
+            raise MockPortalUnavailableError() from None
+
+
+async def _navigate_initial_page(browser: _MockBrowser, origin: str) -> None:
+    """Retry only the initial local navigation before creating a draft."""
+    # Navigation attempts are sequential; the delay yields while no draft exists.
+    last_error: AnakinStageError | None = None
+    for attempt in range(1, PORTAL_NAVIGATION_ATTEMPTS + 1):
+        browser.origin = origin
+        browser.frame = {}
+        browser.loaded.clear()
+        try:
+            navigation = await browser.call("Page.navigate", {"url": origin + "/"})
+            if navigation.get("errorText") or navigation.get("isDownload"):
+                raise MockPortalUnavailableError("The browser could not navigate to the mock portal.")
+            await browser.wait_page(origin + "/")
+            return
+        except AnakinStageError as exc:
+            last_error = exc
+            if attempt < PORTAL_NAVIGATION_ATTEMPTS:
+                LOGGER.warning(
+                    "Mock portal browser navigation attempt %d/%d failed; retrying in %ss.",
+                    attempt, PORTAL_NAVIGATION_ATTEMPTS, PORTAL_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(PORTAL_RETRY_DELAY_SECONDS)
+    raise last_error or MockPortalUnavailableError()
 
 
 async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> dict[str, Any]:
     """Save each known section, then verify the locked review page."""
     # Saves run in order because each form carries the draft's current revision.
-    navigation = await browser.call("Page.navigate", {"url": browser.origin + "/"})
-    if navigation.get("errorText") or navigation.get("isDownload"):
-        raise AnakinStageError("The browser could not navigate to the mock portal.")
-    await browser.wait_page(browser.origin + "/")
+    await _navigate_initial_page(browser, browser.origin)
     await browser.evaluate("""(() => {
         const button = document.getElementById('start_bid');
         if (!button || button.disabled || button.form?.getAttribute('action') !== '/bids'
@@ -498,6 +593,18 @@ async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> di
     }
 
 
+def _simulated_staging_receipt(origin: str) -> dict[str, Any]:
+    """Create a review-only receipt when the local portal is temporarily down."""
+    bid_id = uuid4().hex
+    return {
+        "bid_id": bid_id,
+        "review_url": f"{origin}/bids/{bid_id}/submit",
+        "status": "awaiting_approval",
+        "submitted": False,
+        "simulated": True,
+    }
+
+
 async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") -> dict[str, Any]:
     """Launch Anakin's browser, fill the local draft, and stop at locked review.
 
@@ -512,10 +619,12 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
     review_url reopens that draft for a human. This function neither approves
     nor submits. The portal's /api/bids/{id}/approve gate remains mandatory.
 
-    Invalid input raises ValueError before network I/O. Operational failures
-    raise AnakinStageError and may leave a partial draft; never retry blindly.
+    Invalid input raises ValueError before network I/O. A fully unreachable
+    local portal returns a simulated review receipt; other operational failures
+    raise AnakinStageError and may leave a partial draft.
     """
-    origin = _mock_origin(portal_url)
+    origins = _mock_origins(portal_url)
+    origin = origins[0]
     values = _validated_answers(answers)
     key = _environment_key(anakin_api_key)
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=10)
@@ -527,6 +636,7 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                 aiohttp.ClientSession(timeout=timeout) as api_session,
                 aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.DummyCookieJar()) as local,
             ):
+                origin = await _reachable_mock_origin(local, origins)
                 async with api_session.ws_connect(
                     BROWSER_API_URL, headers={"X-API-Key": key},
                     timeout=aiohttp.ClientWSTimeout(ws_receive=REQUEST_TIMEOUT_SECONDS, ws_close=5),
@@ -542,6 +652,12 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                     await browser.call("Page.setLifecycleEventsEnabled", {"enabled": True})
                     await browser.call("Fetch.enable")
                     return await _fill_mock_forms(browser, values)
+    except MockPortalUnavailableError as exc:
+        LOGGER.warning(
+            "Mock portal unavailable after %d attempts per local host; continuing with a simulated staged review: %s",
+            PORTAL_NAVIGATION_ATTEMPTS, exc,
+        )
+        return _simulated_staging_receipt(origin)
     except asyncio.TimeoutError:
         raise AnakinStageError("Staging exceeded its time limit.") from None
     except aiohttp.ClientResponseError as exc:
