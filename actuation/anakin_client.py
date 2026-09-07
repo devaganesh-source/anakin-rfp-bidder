@@ -464,10 +464,27 @@ class _MockBrowser:
         url, method = request["url"], request["method"]
         if url == self.origin + "/favicon.ico" and method == "GET":
             return {"responseCode": 204, "body": ""}
-        if self.next_request is None:
+        try:
+            parsed_url = urlsplit(url)
+            is_tailwind_cdn = (
+                method == "GET"
+                and parsed_url.scheme == "https"
+                and parsed_url.hostname == "cdn.tailwindcss.com"
+                and parsed_url.port is None
+                and parsed_url.username is None
+                and parsed_url.password is None
+            )
+        except ValueError:
+            is_tailwind_cdn = False
+        if self.next_request is None and not is_tailwind_cdn:
             raise AnakinStageError("Blocked a request after the draft reached review.")
-        expected_method, path = self.next_request
-        if method != expected_method or url != self.origin + path:
+        expected_method, path = self.next_request or (None, None)
+        is_expected_local_request = (
+            self.next_request is not None
+            and method == expected_method
+            and url == self.origin + path
+        )
+        if not is_expected_local_request and not is_tailwind_cdn:
             raise AnakinStageError("Blocked a request outside the mock staging workflow.")
         body = request.get("postData", "")
         if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_FORM_BYTES:
@@ -481,7 +498,11 @@ class _MockBrowser:
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=10),
                 allow_redirects=False,
             ) as response:
-                if response.status != (303 if method == "POST" else 200):
+                allowed_get_statuses = {200}
+                if is_tailwind_cdn:
+                    allowed_get_statuses.update({301, 302, 303, 307, 308})
+                allowed_statuses = {303} if method == "POST" else allowed_get_statuses
+                if response.status not in allowed_statuses:
                     raise AnakinStageError(f"The mock portal returned HTTP {response.status}.")
                 content = await response.read()
                 if method == "POST":
@@ -500,7 +521,7 @@ class _MockBrowser:
                     if destination != self.origin + next_path:
                         raise AnakinStageError("The mock portal redirected outside the next section.")
                     self.next_request = ("GET", next_path)
-                else:
+                elif not is_tailwind_cdn:
                     self.next_request = (
                         None if path.endswith("/submit") else ("POST", "/bids" if path == "/" else path)
                     )
@@ -651,20 +672,7 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                     await browser.call("Page.enable")
                     await browser.call("Page.setLifecycleEventsEnabled", {"enabled": True})
                     await browser.call("Fetch.enable")
-                    try:
-                        return await _fill_mock_forms(browser, values)
-                    except Exception as e:
-                        print(f"Warning: mock bid staging failed; continuing to review gate: {e}")
-                        uid = uuid.uuid4().hex
-                        fail_safe_bid_id = uid
-                        return {
-                            "bid_id": fail_safe_bid_id,
-                            "review_url": f"{origin}/bids/{fail_safe_bid_id}/submit",
-                            "status": "awaiting_approval",
-                            "submitted": False,
-                            "portal_session": f"mock_fail_safe_session_{uid}",
-                            "simulated": True,
-                        }
+                    return await _fill_mock_forms(browser, values)
     except MockPortalUnavailableError as exc:
         LOGGER.warning(
             "Mock portal unavailable after %d attempts per local host; continuing with a simulated staged review: %s",
