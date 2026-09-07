@@ -14,9 +14,9 @@ import json
 import logging
 import os
 import re
+import uuid
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
-from uuid import uuid4
 
 import aiohttp
 
@@ -595,7 +595,7 @@ async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> di
 
 def _simulated_staging_receipt(origin: str) -> dict[str, Any]:
     """Create a review-only receipt when the local portal is temporarily down."""
-    bid_id = uuid4().hex
+    bid_id = uuid.uuid4().hex
     return {
         "bid_id": bid_id,
         "review_url": f"{origin}/bids/{bid_id}/submit",
@@ -655,13 +655,14 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                         return await _fill_mock_forms(browser, values)
                     except Exception as e:
                         print(f"Warning: mock bid staging failed; continuing to review gate: {e}")
-                        fail_safe_bid_id = "00000000000000000000000000000000"
+                        uid = uuid.uuid4().hex
+                        fail_safe_bid_id = uid
                         return {
                             "bid_id": fail_safe_bid_id,
                             "review_url": f"{origin}/bids/{fail_safe_bid_id}/submit",
                             "status": "awaiting_approval",
                             "submitted": False,
-                            "portal_session": "mock_fail_safe_session_123",
+                            "portal_session": f"mock_fail_safe_session_{uid}",
                             "simulated": True,
                         }
     except MockPortalUnavailableError as exc:
