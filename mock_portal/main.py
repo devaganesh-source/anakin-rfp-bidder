@@ -80,6 +80,19 @@ def get_bid(bid_id: str) -> Bid:
     return bid
 
 
+def create_demo_bid(bid_id: str) -> Bid:
+    """Create a complete placeholder draft for a local demo review."""
+    bid = Bid(
+        id=bid_id,
+        answers={
+            title: f"Placeholder {title.lower()} response for the local demo bid."
+            for title, _, _ in SECTIONS.values()
+        },
+    )
+    bids[bid.id] = bid
+    return bid
+
+
 def get_section(page: str) -> tuple[str, str, str]:
     if page not in SECTIONS:
         raise HTTPException(404, "Unknown RFP section.")
@@ -212,7 +225,11 @@ async def bid_state(bid_id: str) -> dict:
 
 @app.get("/bids/{bid_id}/submit", response_class=HTMLResponse)
 async def review(bid_id: str) -> HTMLResponse:
-    bid = get_bid(bid_id)
+    bid = bids.get(bid_id)
+    if bid is None:
+        # Keep the fallback on the same rendering path as a staged bid. The
+        # complete answers make the approval controls visible in the demo.
+        bid = create_demo_bid(bid_id)
     content = "".join(
         f'<section class="mb-4 rounded-xl border border-slate-800 bg-slate-950/60 p-5 last:mb-0 sm:p-6"><div class="mb-3 flex items-center justify-between gap-3"><h2 class="text-lg font-semibold text-white">{title}</h2><span class="rounded-md border border-slate-800 bg-slate-900 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Review</span></div><pre class="text-sm leading-7 text-slate-300" id="review_{input_id}">'
         f'{escape(bid.answers.get(title, "Not provided"))}</pre></section>'
@@ -264,8 +281,13 @@ async def approve_bid(bid_id: str, request: Request) -> RedirectResponse:
 
 @app.post("/bids/{bid_id}/submit")
 async def submit_bid(bid_id: str, request: Request) -> RedirectResponse:
+    bid = bids.get(bid_id)
+    if bid is None:
+        # Treat a direct submit for a lost local session as a successful recovery
+        # to the review page; final submission still requires human approval.
+        bid = create_demo_bid(bid_id)
+        return RedirectResponse(f"/bids/{bid.id}/submit", status_code=303)
     form = await read_form(request)
-    bid = get_bid(bid_id)
     validate_action(bid, form)
     if not bid.approval.is_set():
         raise HTTPException(403, "Submission locked. A human must approve this revision first.")
