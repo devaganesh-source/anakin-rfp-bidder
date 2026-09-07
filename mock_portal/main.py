@@ -27,10 +27,18 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # Disabling the built-in documentation pages avoids their external CDN assets.
 app = FastAPI(title="Procurement Mock Portal", docs_url=None, redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 SECTIONS = {
     "security": ("Security", "security", "Describe your security capabilities."),
     "tech-specs": ("Tech Specs", "tech_specs", "Describe the proposed technical solution."),
@@ -53,10 +61,22 @@ class Bid:
 bids: dict[str, Bid] = {}
 
 
+def portal_error(status_code: int, code: str, message: str) -> HTTPException:
+    """Return a stable JSON error envelope for automation and human clients."""
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
 def get_bid(bid_id: str) -> Bid:
     bid = bids.get(bid_id)
     if bid is None:
-        raise HTTPException(404, "Unknown bid. Start a new bid from the home page.")
+        raise portal_error(
+            404,
+            "BID_NOT_READY",
+            "The bid session is not staged or does not exist. Start a new bid from the home page.",
+        )
     return bid
 
 
@@ -218,6 +238,12 @@ async def approve_bid(bid_id: str, request: Request) -> RedirectResponse:
     require_complete(bid)
     if form.get("confirm") != "yes":
         raise HTTPException(422, "Explicit human confirmation is required.")
+    if bid.approval.is_set():
+        raise portal_error(
+            409,
+            "BID_ALREADY_APPROVED",
+            "This bid has already been approved; duplicate approval is not accepted.",
+        )
     bid.approval.set()  # This endpoint is the only place approval can be granted.
     return RedirectResponse(f"/bids/{bid.id}/submit", status_code=303)
 

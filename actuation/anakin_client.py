@@ -37,15 +37,22 @@ FORM_FIELDS = (
 class AnakinCrawlError(RuntimeError):
     """A failed or incomplete crawl that the caller should flag for review."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(
+        self, message: str, code: str = "ANAKIN_CRAWL_ERROR", status_code: int | None = None
+    ) -> None:
         super().__init__(f"{message} Manual intervention required.")
+        self.code = code
+        self.status_code = status_code
+        self.payload = {"code": code, "message": message}
 
 
 class AnakinStageError(RuntimeError):
     """Staging stopped; any partially saved draft needs manual review."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, code: str = "ANAKIN_STAGE_ERROR") -> None:
         super().__init__(f"{message} Manual intervention required; do not auto-retry staging.")
+        self.code = code
+        self.payload = {"code": code, "message": message}
 
 
 def _environment_key(supplied: str) -> str:
@@ -141,15 +148,19 @@ async def _request_json(
                 raise AnakinCrawlError(f"Anakin returned HTTP {response.status}.")
             data = await response.json()
     except asyncio.TimeoutError as exc:
-        raise AnakinCrawlError("Anakin request timed out.") from exc
+        raise AnakinCrawlError("Anakin request timed out.", "ANAKIN_CRAWL_TIMEOUT") from exc
     except aiohttp.ContentTypeError as exc:
-        raise AnakinCrawlError("Anakin returned a non-JSON response.") from exc
+        raise AnakinCrawlError("Anakin returned a non-JSON response.", "ANAKIN_CRAWL_INVALID_RESPONSE") from exc
     except aiohttp.ClientResponseError as exc:
-        raise AnakinCrawlError(f"Anakin returned HTTP {exc.status}.") from exc
+        raise AnakinCrawlError(
+            f"Anakin returned HTTP {exc.status}.", "ANAKIN_CRAWL_HTTP_ERROR", exc.status
+        ) from exc
     except aiohttp.ClientError as exc:
-        raise AnakinCrawlError("Could not complete the Anakin HTTP request.") from exc
+        raise AnakinCrawlError(
+            "Could not complete the Anakin HTTP request.", "ANAKIN_CRAWL_TRANSPORT_ERROR"
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise AnakinCrawlError("Anakin returned invalid JSON.") from exc
+        raise AnakinCrawlError("Anakin returned invalid JSON.", "ANAKIN_CRAWL_INVALID_JSON") from exc
 
     if not isinstance(data, dict):
         raise AnakinCrawlError("Anakin returned an unexpected JSON structure.")

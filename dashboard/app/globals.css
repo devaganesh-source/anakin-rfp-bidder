@@ -3,9 +3,9 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: light;
-  --page: #f5f7fb;
-  --ink: #12213a;
+  color-scheme: dark;
+  --page: #09090b;
+  --ink: #f4f4f5;
 }
 
 * {
@@ -18,15 +18,52 @@ html {
 
 body {
   margin: 0;
+  min-width: 320px;
   background:
-    radial-gradient(circle at 7% 0%, rgba(71, 106, 224, 0.11), transparent 25rem),
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    radial-gradient(circle at 50% -20%, rgba(79, 70, 229, 0.14), transparent 38rem),
     var(--page);
+  background-size: 72px 72px, 72px 72px, auto, auto;
   color: var(--ink);
   font-family: Arial, Helvetica, sans-serif;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(129, 140, 248, 0.35);
+  color: #fff;
+}
+
+@layer components {
+  .glass-panel {
+    border: 1px solid rgba(39, 39, 42, 0.9);
+    background: rgba(24, 24, 27, 0.6);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    backdrop-filter: blur(24px);
+  }
+
+  .text-gradient {
+    background: linear-gradient(105deg, #a5b4fc 0%, #818cf8 40%, #6ee7b7 105%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
 }
 
 button:focus-visible,
 a:focus-visible {
-  outline: 3px solid rgba(49, 87, 213, 0.35);
-  outline-offset: 3px;
+  outline: 2px solid #a5b4fc;
+  outline-offset: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

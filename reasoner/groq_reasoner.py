@@ -41,6 +41,11 @@ class SectionAnswer(TypedDict):
 class GroqReasonerError(RuntimeError):
     """Generation or validation failed; the caller should flag this for review."""
 
+    def __init__(self, message: str, code: str = "GROQ_REASONER_ERROR") -> None:
+        super().__init__(message)
+        self.code = code
+        self.payload = {"code": code, "message": message}
+
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Reject duplicate JSON keys instead of silently overwriting their values."""
@@ -59,25 +64,34 @@ def _validate_answer(
     try:
         data = json.loads(content, object_pairs_hook=_unique_json_object)
     except json.JSONDecodeError as exc:
-        raise GroqReasonerError("Groq returned invalid JSON.") from exc
+        raise GroqReasonerError("Groq returned invalid JSON.", "GROQ_INVALID_JSON") from exc
 
     if (
         not isinstance(data, dict)
         or set(data) != {"section", "answer", "source_snippet"}
         or not all(isinstance(value, str) for value in data.values())
     ):
-        raise GroqReasonerError("Groq output must contain exactly three string fields.")
+        raise GroqReasonerError(
+            "Groq output must contain exactly three string fields.",
+            "GROQ_INVALID_RESPONSE",
+        )
     if data["section"] != section_title:
-        raise GroqReasonerError("Groq returned an answer for the wrong section.")
+        raise GroqReasonerError("Groq returned an answer for the wrong section.", "GROQ_INVALID_RESPONSE")
     if not data["answer"].strip():
-        raise GroqReasonerError("Groq returned an empty answer.")
+        raise GroqReasonerError("Groq returned an empty answer.", "GROQ_INVALID_RESPONSE")
 
     snippet = data["source_snippet"]
     if data["answer"] == "CAPABILITY_NOT_FOUND":
         if snippet != "":
-            raise GroqReasonerError("An unsupported answer must have an empty source snippet.")
+            raise GroqReasonerError(
+                "An unsupported answer must have an empty source snippet.",
+                "GROQ_INVALID_RESPONSE",
+            )
     elif not snippet.strip() or not any(snippet in chunk for chunk in context):
-        raise GroqReasonerError("Groq's source snippet was not found in the retrieved context.")
+        raise GroqReasonerError(
+            "Groq's source snippet was not found in the retrieved context.",
+            "GROQ_INVALID_RESPONSE",
+        )
 
     return SectionAnswer(
         section=data["section"], answer=data["answer"], source_snippet=snippet
@@ -96,6 +110,12 @@ async def generate_section_answer(
     despite its retirement; API errors are surfaced without a model fallback.
     """
     context = [retrieved_context] if isinstance(retrieved_context, str) else list(retrieved_context)
+    if not isinstance(section_title, str) or not section_title.strip():
+        raise GroqReasonerError("RFP section title is missing.", "RFP_SECTION_INVALID")
+    if not isinstance(section_text, str) or not section_text.strip():
+        raise GroqReasonerError(
+            f"RFP section '{section_title}' is empty.", "RFP_SECTION_INVALID"
+        )
     if not any(chunk.strip() for chunk in context):
         return SectionAnswer(
             section=section_title, answer="CAPABILITY_NOT_FOUND", source_snippet=""
@@ -130,19 +150,20 @@ async def generate_section_answer(
                     ],
                 )
     except (APITimeoutError, asyncio.TimeoutError) as exc:
-        raise GroqReasonerError("Groq section generation timed out.") from exc
+        raise GroqReasonerError("Groq section generation timed out.", "GROQ_TIMEOUT") from exc
     except APIStatusError as exc:
         raise GroqReasonerError(
-            f"Groq returned HTTP {exc.status_code} for model {MODEL}."
+            f"Groq returned HTTP {exc.status_code} for model {MODEL}.",
+            "GROQ_API_ERROR",
         ) from exc
     except APIError as exc:
-        raise GroqReasonerError("The Groq API request failed.") from exc
+        raise GroqReasonerError("The Groq API request failed.", "GROQ_API_ERROR") from exc
 
     if not completion.choices or completion.choices[0].finish_reason != "stop":
-        raise GroqReasonerError("Groq did not return a complete answer.")
+        raise GroqReasonerError("Groq did not return a complete answer.", "GROQ_INCOMPLETE_RESPONSE")
     content = completion.choices[0].message.content
     if not isinstance(content, str) or not content.strip():
-        raise GroqReasonerError("Groq returned no answer content.")
+        raise GroqReasonerError("Groq returned no answer content.", "GROQ_INVALID_RESPONSE")
     return _validate_answer(content, section_title, context)
 
 
@@ -156,9 +177,22 @@ async def process_all_sections(
     All started section calls settle before an error is propagated. Failures
     are never disguised as CAPABILITY_NOT_FOUND or returned as answer objects.
     """
+    if not isinstance(sections_dict, Mapping):
+        raise GroqReasonerError(
+            "The RFP sections payload is missing or malformed.", "RFP_SECTIONS_MISSING"
+        )
     sections = list(sections_dict.items())
     if not sections:
-        return []
+        raise GroqReasonerError(
+            "The RFP contains no sections.", "RFP_SECTIONS_MISSING"
+        )
+    for title, text in sections:
+        if not isinstance(title, str) or not title.strip():
+            raise GroqReasonerError("An RFP section title is missing.", "RFP_SECTION_INVALID")
+        if not isinstance(text, str) or not text.strip():
+            raise GroqReasonerError(
+                f"RFP section '{title}' is empty.", "RFP_SECTION_INVALID"
+            )
 
     def retrieve_contexts() -> list[list[str]]:
         return [

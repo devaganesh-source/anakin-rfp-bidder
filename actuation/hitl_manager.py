@@ -19,6 +19,7 @@ This trusted local demo has no authentication; state resets on process restart.
 
 import asyncio
 import inspect
+import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -28,13 +29,25 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 
 from actuation.anakin_client import _mock_origin
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 BidStatus = Literal["awaiting_approval", "submitting", "submitted", "manual_intervention"]
 SubmitAction = Callable[[], Awaitable[bool]]
+
+
+def _http_error(status_code: int, code: str, message: str) -> HTTPException:
+    """Return one stable error envelope for dashboard and resilience clients."""
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
 
 
 class ReviewSection(BaseModel):
@@ -174,7 +187,7 @@ class HITLManager:
     def _get_bid(self, bid_id: str) -> _StagedBid:
         bid = self._bids.get(bid_id)
         if bid is None:
-            raise HTTPException(404, "Unknown bid.")
+            raise _http_error(404, "BID_NOT_READY", "The bid session is not staged or does not exist.")
         return bid
 
     @staticmethod
@@ -197,14 +210,24 @@ class HITLManager:
         bid = self._get_bid(bid_id)
         response.headers["Cache-Control"] = "no-store"
         if self._closed:
-            raise HTTPException(503, "The HITL manager is shutting down.")
+            raise _http_error(503, "HITL_SHUTTING_DOWN", "The HITL manager is shutting down.")
         if bid.status == "manual_intervention":
-            raise HTTPException(409, bid.error)
+            raise _http_error(
+                409,
+                "BID_MANUAL_INTERVENTION_REQUIRED",
+                bid.error or "Manual intervention is required.",
+            )
+        if bid.status in {"submitting", "submitted"}:
+            raise _http_error(
+                409,
+                "BID_ALREADY_APPROVED",
+                "This bid has already been approved; duplicate approval is not accepted.",
+            )
         if bid.status == "awaiting_approval":
             if bid.task is None or bid.task.done():
                 bid.status = "manual_intervention"
                 bid.error = "Approval waiter is unavailable; manual intervention required."
-                raise HTTPException(409, bid.error)
+                raise _http_error(409, "BID_WAITER_UNAVAILABLE", bid.error)
             bid.status = "submitting"
             bid.approval.set()  # Only this POST endpoint may release the submission gate.
         response.status_code = 200 if bid.status == "submitted" else 202
@@ -257,6 +280,36 @@ class HITLManager:
 
 manager = HITLManager()
 router = manager.router
+_generation_lock = asyncio.Lock()
+
+
+async def _generate_bid(response: Response) -> BidSnapshot:
+    """Run one proposal pipeline from the dashboard and return its review state."""
+    response.headers["Cache-Control"] = "no-store"
+    if _generation_lock.locked():
+        raise _http_error(
+            409,
+            "BID_GENERATION_IN_PROGRESS",
+            "Another bid is already being generated. Wait for it to finish before starting another.",
+        )
+
+    # Import lazily to keep the HITL manager reusable without creating an import
+    # cycle: run_bid imports this module for the shared manager instance.
+    from run_bid import run_pipeline
+
+    async with _generation_lock:
+        try:
+            # Retrieval and section reasoning happen inside the orchestrator;
+            # the reasoner's section calls run concurrently, while this lock
+            # serializes browser staging so one request owns one generated draft.
+            return await run_pipeline()
+        except Exception as exc:
+            LOGGER.exception("Dashboard bid generation failed")
+            raise _http_error(
+                502,
+                "BID_GENERATION_FAILED",
+                f"Bid generation stopped before a review session was created ({type(exc).__name__}).",
+            ) from exc
 
 
 @asynccontextmanager
@@ -269,4 +322,19 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RFP Bid Approval", lifespan=_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 app.include_router(router)
+app.add_api_route(
+    "/api/bids/generate",
+    _generate_bid,
+    methods=["POST"],
+    response_model=BidSnapshot,
+    status_code=201,
+    tags=["HITL"],
+)
