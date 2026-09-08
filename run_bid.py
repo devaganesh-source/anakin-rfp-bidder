@@ -22,29 +22,30 @@ from dotenv import load_dotenv
 
 from actuation.anakin_client import stage_bid
 from actuation.hitl_manager import BidSnapshot, app as hitl_app, manager
+from crawler import RFPCrawler
 from reasoner.groq_reasoner import process_all_sections
 from reasoner.vector_store import build_index, load_and_chunk_docs
 from start_backend import ensure_port_available
 
 
-RFP_SECTIONS = {
-    "Security": "Describe your encryption, compliance, support, and authentication capabilities.",
-    "Tech Specs": "Describe the technical solution and integrations available for this proposal.",
-    "Pricing": "Describe the pricing model and commercial terms for this proposal.",
-}
 SUBMIT_TIMEOUT_SECONDS = 30
 
 
-def _required_environment() -> tuple[str, str, str]:
-    """Return required credentials and the configured local portal URL."""
+def _required_environment() -> tuple[str, str, str, str]:
+    """Return required credentials and configured local workflow URLs."""
     values = {
         name: os.environ.get(name, "").strip()
-        for name in ("GROQ_API_KEY", "ANAKIN_API_KEY", "MOCK_PORTAL_URL")
+        for name in ("GROQ_API_KEY", "ANAKIN_API_KEY", "MOCK_PORTAL_URL", "RFP_SOURCE_URL")
     }
     missing = [name for name, value in values.items() if not value]
     if missing:
         raise RuntimeError(f"Set {', '.join(missing)} in .env or the environment.")
-    return values["GROQ_API_KEY"], values["ANAKIN_API_KEY"], values["MOCK_PORTAL_URL"]
+    return (
+        values["GROQ_API_KEY"],
+        values["ANAKIN_API_KEY"],
+        values["MOCK_PORTAL_URL"],
+        values["RFP_SOURCE_URL"],
+    )
 
 
 def _hitl_port() -> int:
@@ -159,7 +160,12 @@ async def run_pipeline() -> BidSnapshot:
     """Build the proposal, stage it, register HITL state, and return its session."""
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env")
-    _, anakin_api_key, portal_url = _required_environment()
+    _, anakin_api_key, portal_url, rfp_source_url = _required_environment()
+
+    crawler = RFPCrawler(rfp_source_url)
+    rfp_html = await crawler.fetch_html()
+    RFP_SECTIONS = crawler.parse_rfp(crawler.clean_dom(rfp_html))
+    print(f"DEBUG: Scraped {len(RFP_SECTIONS)} sections from RFP.")
 
     chunks = load_and_chunk_docs(project_root / "sample-data")
     faiss_index = build_index(chunks)
@@ -184,7 +190,7 @@ async def main(serve: bool = True) -> None:
     load_dotenv(project_root / ".env")
     hitl_host = os.environ.get("HITL_HOST", "127.0.0.1")
     hitl_port = _hitl_port()
-    _, _, portal_url = _required_environment()
+    _, _, portal_url, _ = _required_environment()
     _validate_local_service_ports(portal_url, hitl_port)
     if serve:
         ensure_port_available(hitl_host, hitl_port)

@@ -12,7 +12,7 @@ from groq import APIError, APIStatusError, APITimeoutError, AsyncGroq
 from reasoner.vector_store import search_index
 
 
-# Retained as requested; Groq lists this model as retired.
+# Restored to the model supported by your specific Groq API tier
 MODEL = "openai/gpt-oss-20b"
 REQUEST_TIMEOUT_SECONDS = 60.0
 SYSTEM_PROMPT = (
@@ -61,8 +61,17 @@ def _validate_answer(
     content: str, section_title: str, context: Sequence[str]
 ) -> SectionAnswer:
     """Validate schema and snippet provenance; this does not prove entailment."""
+    cleaned_content = content.strip()
+    if cleaned_content.startswith("```json"):
+        cleaned_content = cleaned_content[7:]
+    elif cleaned_content.startswith("```"):
+        cleaned_content = cleaned_content[3:]
+    if cleaned_content.endswith("```"):
+        cleaned_content = cleaned_content[:-3]
+    cleaned_content = cleaned_content.strip()
+
     try:
-        data = json.loads(content, object_pairs_hook=_unique_json_object)
+        data = json.loads(cleaned_content, object_pairs_hook=_unique_json_object)
     except json.JSONDecodeError as exc:
         raise GroqReasonerError("Groq returned invalid JSON.", "GROQ_INVALID_JSON") from exc
 
@@ -103,12 +112,7 @@ async def generate_section_answer(
     section_text: str,
     retrieved_context: str | Sequence[str],
 ) -> SectionAnswer:
-    """Generate one JSON-mode answer, or raise GroqReasonerError on failure.
-
-    GROQ_API_KEY is read from the environment. An empty context returns the
-    required sentinel without a network call. The requested model is retained
-    despite its retirement; API errors are surfaced without a model fallback.
-    """
+    """Generate one JSON-mode answer, or raise GroqReasonerError on failure."""
     context = [retrieved_context] if isinstance(retrieved_context, str) else list(retrieved_context)
     if not isinstance(section_title, str) or not section_title.strip():
         raise GroqReasonerError("RFP section title is missing.", "RFP_SECTION_INVALID")
@@ -124,11 +128,10 @@ async def generate_section_answer(
     if not api_key:
         raise GroqReasonerError("GROQ_API_KEY is not set in the environment.")
 
-    # Each call owns its client; awaited I/O lets other section requests progress.
     try:
         async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
             async with AsyncGroq(
-                api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0
+                api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=2
             ) as client:
                 completion = await client.chat.completions.create(
                     model=MODEL,
@@ -172,11 +175,7 @@ async def process_all_sections(
     faiss_index: faiss.IndexFlatIP,
     chunks: Sequence[str],
 ) -> list[SectionAnswer]:
-    """Retrieve evidence and generate answers in the input's iteration order.
-
-    All started section calls settle before an error is propagated. Failures
-    are never disguised as CAPABILITY_NOT_FOUND or returned as answer objects.
-    """
+    """Retrieve evidence and generate answers in the input's iteration order."""
     if not isinstance(sections_dict, Mapping):
         raise GroqReasonerError(
             "The RFP sections payload is missing or malformed.", "RFP_SECTIONS_MISSING"
@@ -200,8 +199,6 @@ async def process_all_sections(
             for title, text in sections
         ]
 
-    # Retrieval runs sequentially in one worker thread, leaving the event loop
-    # free. gather runs all Groq calls concurrently; there is no approval lock here.
     contexts = await asyncio.to_thread(retrieve_contexts)
     results = await asyncio.gather(
         *(

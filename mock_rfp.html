@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vendor Procurement Portal - RFP 2026-014</title>
+  <style>
+    body {
+      margin: 0;
+      background: #e7e7e7;
+      color: #222;
+      font: 12px Arial, Helvetica, sans-serif;
+    }
+
+    #page {
+      width: 960px;
+      margin: 12px auto 80px;
+      border: 1px solid #777;
+      background: #fff;
+      box-shadow: 0 0 5px #999;
+    }
+
+    #header {
+      padding: 15px 18px;
+      color: #fff;
+      background: linear-gradient(#345d88, #173a60);
+    }
+
+    #header h1 { margin: 0; font-size: 22px; }
+    #header span { color: #d6e4f1; }
+
+    #nav {
+      padding: 8px 14px;
+      border-top: 1px solid #7892aa;
+      border-bottom: 1px solid #777;
+      background: #d8d8d8;
+    }
+
+    #nav a {
+      margin-right: 22px;
+      color: #123e6b;
+      font-weight: bold;
+      text-decoration: none;
+    }
+
+    #content { padding: 18px 22px 28px; }
+    h2 { color: #234d78; font-size: 18px; border-bottom: 1px solid #aaa; }
+    h3 { color: #444; font-size: 14px; margin-bottom: 4px; }
+    p { line-height: 1.45; }
+
+    .notice {
+      padding: 8px;
+      border: 1px solid #d4c071;
+      background: #fff8cf;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 24px;
+    }
+
+    th, td {
+      padding: 7px;
+      border: 1px solid #888;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { color: #fff; background: #4c6680; }
+    tr:nth-child(even) { background: #eeeeee; }
+    .item-ref { width: 95px; font-family: "Courier New", monospace; }
+
+    #legal {
+      padding: 14px 20px;
+      border-top: 3px double #888;
+      color: #666;
+      background: #efefef;
+      font-size: 10px;
+    }
+
+    #cookie-banner {
+      position: fixed;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 10;
+      padding: 12px 20px;
+      border-top: 2px solid #222;
+      color: #fff;
+      background: #333;
+    }
+
+    #cookie-banner button {
+      float: right;
+      padding: 4px 18px;
+      border: 1px outset #ddd;
+      background: #eee;
+      color: #111;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="page">
+    <div id="header">
+      <h1>Northstar Industries <span>Supplier Gateway</span></h1>
+    </div>
+
+    <div id="nav">
+      <a href="#">Home</a>
+      <a href="#">Open Solicitations</a>
+      <a href="#">Vendor Registration</a>
+      <a href="#">Policies &amp; Forms</a>
+      <a href="#">Contact Purchasing</a>
+    </div>
+
+    <div id="content">
+      <div style="float:right; color:#666;">Last updated: 09/09/2026 14:35 IST</div>
+      <h2>REQUEST FOR PROPOSAL #2026-014</h2>
+      <p><b>Enterprise Knowledge Management and Response Automation Platform</b></p>
+      <p class="notice">Vendors must review all sections, appendices, amendments, and notices. Information shown on this page may be supplemented without prior email notification.</p>
+
+      <h3>1. Overview / General Instructions</h3>
+      <p>The selected vendor shall provide a hosted solution for organizing internal capability documents and assisting authorized employees with complex questionnaire responses. Proposals must remain valid for the period stated in Appendix D.</p>
+
+      <h2>Mandatory Security Controls</h2>
+      <table summary="Mandatory security requirements">
+        <tr>
+          <th>Item Ref</th>
+          <th>Requirement Text</th>
+        </tr>
+        <tr>
+          <td class="item-ref">SEC-01</td>
+          <td>The solution must support single sign-on using SAML 2.0 and allow administrators to disable local password authentication.</td>
+        </tr>
+        <tr>
+          <td class="item-ref">SEC-02</td>
+          <td>Customer data must be encrypted in transit using currently supported TLS protocols and encrypted at rest with vendor-managed or customer-managed keys.</td>
+        </tr>
+        <tr>
+          <td class="item-ref">SEC-03</td>
+          <td>The platform shall maintain an exportable audit trail for document access, administrative changes, approval decisions, and final submissions.</td>
+        </tr>
+        <tr>
+          <td class="item-ref">SEC-04</td>
+          <td>Role-based access controls must separate content authors, reviewers, approvers, and system administrators.</td>
+        </tr>
+      </table>
+
+      <h3>TECHNICAL ENVIRONMENT</h3>
+      <p>The proposed service must expose documented HTTPS APIs for approved integrations. The vendor response should describe authentication, pagination, rate-limit handling, and error reporting.</p>
+
+      <h2>Document Ingestion</h2>
+      <p>Users must be able to ingest PDF, DOCX, HTML, and plain-text reference material. The system should preserve source attribution so reviewers can identify the supporting document for a generated draft.</p>
+
+      <p style="margin: 19px 7px 6px;"><strong>Human Approval Before Submission:</strong> Any workflow that enters responses into the procurement portal must pause before the final submission action. A named, authorized employee must explicitly approve the staged bid before it can be submitted.</p>
+
+      <h3>Response Quality and Traceability</h3>
+      <p>Each drafted answer shall include references to the internal source material used. Where relevant evidence is unavailable, the system must flag the answer for manual completion rather than creating unsupported claims.</p>
+
+      <p><strong>Deployment and Data Location.</strong> The proposal must identify available hosting regions, tenant-isolation controls, backup arrangements, and the process for exporting or deleting customer content at contract termination.</p>
+
+      <h2 style="border-bottom:none; text-decoration:underline;">Pricing submission notes</h2>
+      <p>Provide implementation fees, recurring subscription charges, optional service fees, and applicable taxes as separate line items. Do not include confidential pricing in the technical response attachment.</p>
+
+      <h3>Vendor Support</h3>
+      <p>Describe standard support channels, escalation procedures, maintenance communications, and customer responsibilities. Any service commitments must be clearly identified as standard or optional.</p>
+
+      <table summary="Submission checklist" style="width:72%;">
+        <tr><th>Item Ref</th><th>Requirement Text</th></tr>
+        <tr><td class="item-ref">SUB-01</td><td>Upload one technical response in PDF format.</td></tr>
+        <tr><td class="item-ref">SUB-02</td><td>Upload pricing as a separate attachment.</td></tr>
+        <tr><td class="item-ref">SUB-03</td><td>Confirm acceptance of the supplier code of conduct or list requested exceptions.</td></tr>
+      </table>
+
+      <p style="color:#777;">Questions regarding this solicitation must be submitted through the portal message center. Telephone inquiries will not form part of the official procurement record.</p>
+    </div>
+
+    <div id="legal">
+      <strong>LEGAL NOTICE:</strong> This portal and its contents are provided for authorized procurement activities only. Publication of this RFP does not obligate Northstar Industries to award a contract or reimburse proposal preparation costs. Northstar Industries may amend, suspend, or cancel the solicitation subject to applicable procurement policies.<br><br>
+      Copyright &copy; 2010-2026 Northstar Industries. All rights reserved. &nbsp;|&nbsp; Privacy Statement &nbsp;|&nbsp; Terms of Use &nbsp;|&nbsp; Accessibility
+    </div>
+  </div>
+
+  <div id="cookie-banner">
+    <button type="button" onclick="document.getElementById('cookie-banner').style.display='none'">Accept Cookies</button>
+    <strong>Cookie Notice:</strong> This site uses required cookies to maintain your supplier portal session. Continued use indicates acceptance of the portal cookie policy.
+  </div>
+</body>
+</html>

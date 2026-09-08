@@ -1,3 +1,11 @@
-Pricing Model:
-Our enterprise license costs $150 per user per month, billed annually.
-Implementation and onboarding require a one-time flat fee of $5,000.
+# Commercial Terms, Pricing, and Vendor Support
+
+## Pricing and Implementation Fees (Pricing submission notes)
+- Recurring Subscription: Enterprise licenses are billed at $150 per user per month, billed annually.
+- Implementation Fee: A one-time professional services and onboarding implementation fee of $5,000 applies.
+- Taxes & Add-ons: Applicable local taxes and optional dedicated support packages are itemized as separate line items on all commercial invoices. Confidential pricing is kept strictly separate from technical response attachments.
+
+## Vendor Support and Maintenance (Vendor Support)
+- Standard Support Channels: 24/7 ticketing, email support, and a dedicated customer success manager.
+- Escalation Procedures: Critical issues carry a guaranteed 1-hour response time SLA. 
+- Maintenance Communications: Planned maintenance windows are communicated via our status page 72 hours in advance. Standard and optional service commitments are clearly designated in the master service agreement.
