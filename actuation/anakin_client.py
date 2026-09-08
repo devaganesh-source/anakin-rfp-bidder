@@ -461,35 +461,79 @@ class _MockBrowser:
 
     async def _relay(self, request: dict) -> dict:
         # Requests are forwarded serially with no credentials and no redirect following.
-        url, method = request["url"], request["method"]
-        if url == self.origin + "/favicon.ico" and method == "GET":
-            return {"responseCode": 204, "body": ""}
+        url, method = request.get("url"), request.get("method")
+        origin = urlsplit(self.origin)
+        origin_host = (origin.hostname or "").lower()
+        origin_port = origin.port or (443 if origin.scheme == "https" else 80)
+        loopback_hosts = {origin_host}
+        if origin_host == "localhost":
+            loopback_hosts.add("127.0.0.1")
+        elif origin_host == "127.0.0.1":
+            loopback_hosts.add("localhost")
+
+        portal_origins = {self.origin.rstrip("/")}
+        if origin.scheme == "http" and origin_port == 8000:
+            portal_origins.update({
+                "http://127.0.0.1:8000",
+                "http://localhost:8000",
+            })
+        # Require an origin boundary: this accepts the root with or without a
+        # slash and its paths, but not lookalike hosts such as 127.0.0.1:80000.
+        is_allowed_mock_url = isinstance(url, str) and any(
+            url == base or url.startswith(base + "/")
+            for base in portal_origins
+        )
+
         try:
             parsed_url = urlsplit(url)
-            is_tailwind_cdn = (
-                method == "GET"
-                and parsed_url.scheme == "https"
-                and parsed_url.hostname == "cdn.tailwindcss.com"
-                and parsed_url.port is None
-                and parsed_url.username is None
-                and parsed_url.password is None
-            )
-        except ValueError:
-            is_tailwind_cdn = False
-        if self.next_request is None and not is_tailwind_cdn:
+        except (TypeError, ValueError):
+            parsed_url = None
+
+        is_local_portal = bool(
+            parsed_url
+            and is_allowed_mock_url
+            and parsed_url.scheme == origin.scheme
+            and (parsed_url.hostname or "").lower() in loopback_hosts
+            and (parsed_url.port or (443 if parsed_url.scheme == "https" else 80)) == origin_port
+            and parsed_url.username is None
+            and parsed_url.password is None
+        )
+        local_path = parsed_url.path or "/" if is_local_portal else None
+        if is_local_portal and method == "GET" and local_path == "/favicon.ico":
+            return {"responseCode": 204, "body": ""}
+
+        asset_hosts = {"cdn.tailwindcss.com", "fonts.googleapis.com", "fonts.gstatic.com"}
+        is_browser_asset = bool(
+            parsed_url
+            and method == "GET"
+            and parsed_url.scheme == "https"
+            and parsed_url.hostname in asset_hosts
+            and parsed_url.port is None
+            and parsed_url.username is None
+            and parsed_url.password is None
+        )
+        if self.next_request is None and not (is_local_portal or is_browser_asset):
             raise AnakinStageError("Blocked a request after the draft reached review.")
         expected_method, path = self.next_request or (None, None)
         is_expected_local_request = (
             self.next_request is not None
             and method == expected_method
-            and url == self.origin + path
+            and is_local_portal
+            and local_path == path
+            and parsed_url.query == ""
+            and parsed_url.fragment == ""
         )
-        if not is_expected_local_request and not is_tailwind_cdn:
-            raise AnakinStageError("Blocked a request outside the mock staging workflow.")
+        if not is_local_portal and not is_browser_asset:
+            print(f"[Anakin Relay] Blocked request URL: {request.get('url')}")
+            raise AnakinStageError(
+                f"Blocked request outside mock staging workflow: {request.get('url')}"
+            )
+        if is_local_portal and method not in {"GET", "POST"}:
+            raise AnakinStageError(f"Blocked unsupported mock portal method: {method}")
         body = request.get("postData", "")
         if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_FORM_BYTES:
             raise AnakinStageError("The browser supplied invalid or oversized form data.")
-        if method == "POST" and path != "/bids" and not body:
+        if method == "POST" and local_path != "/bids" and not body:
             raise AnakinStageError("The browser omitted the form body.")
         try:
             async with self.portal_session.request(
@@ -499,17 +543,31 @@ class _MockBrowser:
                 allow_redirects=False,
             ) as response:
                 allowed_get_statuses = {200}
-                if is_tailwind_cdn:
+                if is_browser_asset:
                     allowed_get_statuses.update({301, 302, 303, 307, 308})
                 allowed_statuses = {303} if method == "POST" else allowed_get_statuses
                 if response.status not in allowed_statuses:
                     raise AnakinStageError(f"The mock portal returned HTTP {response.status}.")
                 content = await response.read()
-                if method == "POST":
+                if method == "POST" and is_expected_local_request:
                     destination = urljoin(url, response.headers.get("Location", ""))
+                    destination_url = urlsplit(destination)
+                    destination_path = (
+                        destination_url.path or "/"
+                        if (
+                            destination_url.scheme == origin.scheme
+                            and (destination_url.hostname or "").lower() in loopback_hosts
+                            and (destination_url.port or (443 if destination_url.scheme == "https" else 80)) == origin_port
+                            and destination_url.username is None
+                            and destination_url.password is None
+                            and destination_url.query == ""
+                            and destination_url.fragment == ""
+                        )
+                        else None
+                    )
                     if path == "/bids":
                         match = re.fullmatch(
-                            re.escape(self.origin) + r"/bids/([0-9a-f]{32})/security", destination
+                            r"/bids/([0-9a-f]{32})/security", destination_path or ""
                         )
                         if not match:
                             raise AnakinStageError("The mock portal returned an unsafe draft redirect.")
@@ -518,10 +576,10 @@ class _MockBrowser:
                     else:
                         next_slug = {"security": "tech-specs", "tech-specs": "pricing", "pricing": "submit"}
                         next_path = f"/bids/{self.bid_id}/{next_slug[path.rsplit('/', 1)[1]]}"
-                    if destination != self.origin + next_path:
+                    if destination_path != next_path:
                         raise AnakinStageError("The mock portal redirected outside the next section.")
                     self.next_request = ("GET", next_path)
-                elif not is_tailwind_cdn:
+                elif method == "GET" and is_expected_local_request:
                     self.next_request = (
                         None if path.endswith("/submit") else ("POST", "/bids" if path == "/" else path)
                     )

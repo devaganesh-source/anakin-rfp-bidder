@@ -281,17 +281,16 @@ async def approve_bid(bid_id: str, request: Request) -> RedirectResponse:
 
 @app.post("/bids/{bid_id}/submit")
 async def submit_bid(bid_id: str, request: Request) -> RedirectResponse:
-    bid = bids.get(bid_id)
-    if bid is None:
-        # Treat a direct submit for a lost local session as a successful recovery
-        # to the review page; final submission still requires human approval.
-        bid = create_demo_bid(bid_id)
-        return RedirectResponse(f"/bids/{bid.id}/submit", status_code=303)
+    # Resolve the stored bid before mutating it; an unknown session cannot be
+    # treated as a successful submission because there is no record to verify.
+    bid = get_bid(bid_id)
     form = await read_form(request)
     validate_action(bid, form)
     if not bid.approval.is_set():
         raise HTTPException(403, "Submission locked. A human must approve this revision first.")
     require_complete(bid)
+    # Persist the final state before redirecting so both the review page and
+    # the polling API observe the same confirmed submission.
     bid.submitted = True
     bid.approval.clear()  # Consume approval; replaying the POST cannot submit again.
     return RedirectResponse(f"/bids/{bid.id}/submit", status_code=303)

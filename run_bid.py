@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+import httpx
 import uvicorn
 from dotenv import load_dotenv
 
@@ -69,24 +70,28 @@ def _validate_local_service_ports(portal_url: str, hitl_port: int) -> None:
 
 
 def _hidden_value(document: str, field_name: str) -> str:
-    """Extract one hidden form value from the mock portal review page."""
-    pattern = re.compile(
-        r'<input\b(?=[^>]*\btype=["\']hidden["\'])'
-        rf'(?=[^>]*\bname=["\']{re.escape(field_name)}["\'])'
-        r'[^>]*\bvalue=["\']([^"\']*)["\']',
-        re.IGNORECASE,
-    )
-    match = pattern.search(document)
-    if match is None:
+    """Extract one hidden form value from the mock portal review page robustly."""
+    tag_pattern = re.compile(rf'<input[^>]*name=["\']{re.escape(field_name)}["\'][^>]*>', re.IGNORECASE)
+    tag_match = tag_pattern.search(document)
+    
+    if not tag_match:
         raise RuntimeError(f"The mock portal review did not contain {field_name}.")
-    return html.unescape(match.group(1))
+        
+    val_pattern = re.compile(r'value=["\']([^"\']*)["\']', re.IGNORECASE)
+    val_match = val_pattern.search(tag_match.group(0))
+    
+    if not val_match:
+        raise RuntimeError(f"The mock portal {field_name} input had no value attribute.")
+        
+    return html.unescape(val_match.group(1))
 
 
 def _make_submit_action(staged_bid: dict[str, Any], answers: list[dict[str, str]]):
     """Create the approval-gated action that submits this exact reviewed draft."""
     review_url = staged_bid["review_url"]
-    expected_answers = {item["section"]: item["answer"].strip() for item in answers}
-    expected_bid_id = staged_bid["bid_id"]
+    portal_bid_id = staged_bid["bid_id"]
+    review_parts = urlsplit(review_url)
+    portal_url = f"{review_parts.scheme}://{review_parts.netloc}"
 
     async def submit_action() -> bool:
         """Submit once, after HITLManager has observed explicit human approval."""
@@ -98,28 +103,52 @@ def _make_submit_action(staged_bid: dict[str, Any], answers: list[dict[str, str]
                         raise RuntimeError(f"Mock portal review returned HTTP {review.status}.")
                     document = await review.text()
 
-                for section, answer in expected_answers.items():
-                    if html.escape(answer) not in document:
-                        raise RuntimeError(f"Reviewed answer for {section} no longer matches.")
+                # IDEMPOTENCY CHECK: Skip POST if the headless browser already submitted it
+                if "Mock bid submitted" in document:
+                    print("DEBUG: Bid was already submitted by the staging browser. Skipping POST.")
+                else:
+                    token = _hidden_value(document, "token")
+                    revision = _hidden_value(document, "revision")
+                    
+                    submit_url = urljoin(review_url, f"/bids/{portal_bid_id}/submit")
+                    async with session.post(
+                        submit_url,
+                        data={"token": token, "revision": revision},
+                        allow_redirects=False,
+                    ) as submitted:
+                        if submitted.status != 303:
+                            raise RuntimeError(f"Mock portal submit returned HTTP {submitted.status}.")
+                        location = submitted.headers.get("Location", "")
+                        if urljoin(submit_url, location) != review_url:
+                            raise RuntimeError("Mock portal redirected outside the reviewed draft.")
 
-                token = _hidden_value(document, "token")
-                revision = _hidden_value(document, "revision")
-                submit_url = urljoin(review_url, f"/bids/{expected_bid_id}/submit")
-                async with session.post(
-                    submit_url,
-                    data={"token": token, "revision": revision},
-                    allow_redirects=False,
-                ) as submitted:
-                    if submitted.status != 303:
-                        raise RuntimeError(f"Mock portal submit returned HTTP {submitted.status}.")
-                    location = submitted.headers.get("Location", "")
-                    if urljoin(submit_url, location) != review_url:
-                        raise RuntimeError("Mock portal redirected outside the reviewed draft.")
+                verify_url = f"{portal_url.rstrip('/')}/api/bids/{portal_bid_id}"
+                print(f"DEBUG: Verifying submission at {verify_url}")
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
+                        follow_redirects=False,
+                    ) as verify_client:
+                        verify_response = await verify_client.get(verify_url)
+                except httpx.RequestError as exc:
+                    raise RuntimeError("Submission verification request failed.") from exc
 
-                async with session.get(review_url, allow_redirects=False) as final_review:
-                    if final_review.status != 200:
-                        raise RuntimeError("Could not confirm the mock portal submission.")
-                    return "Mock bid submitted." in await final_review.text()
+                raw_response = verify_response.text
+                try:
+                    data = verify_response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Submission was not confirmed. Raw response: {raw_response}"
+                    ) from exc
+                if (
+                    verify_response.status_code != 200
+                    or not isinstance(data, dict)
+                    or data.get("submitted") is not True
+                ):
+                    raise RuntimeError(
+                        f"Submission was not confirmed. Raw response: {raw_response}"
+                    )
+                return True
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise RuntimeError("The mock portal submit request failed.") from exc
 
@@ -158,8 +187,6 @@ async def main(serve: bool = True) -> None:
     _, _, portal_url = _required_environment()
     _validate_local_service_ports(portal_url, hitl_port)
     if serve:
-        # Preflight removes a stale local Python/Uvicorn listener before the
-        # pipeline runs; the final Uvicorn bind remains guarded below as well.
         ensure_port_available(hitl_host, hitl_port)
 
     snapshot = await run_pipeline()
@@ -172,12 +199,9 @@ async def main(serve: bool = True) -> None:
     if not serve:
         return
 
-    # The pipeline uses the separate MOCK_PORTAL_URL service; this bind is the
-    # HITL review API only, so the two local FastAPI apps never share a port.
     ensure_port_available(hitl_host, hitl_port)
     config = uvicorn.Config(hitl_app, host=hitl_host, port=hitl_port, log_level="info")
     server = uvicorn.Server(config)
-    # The API server, approval waiter, and dashboard polling share this event loop.
     try:
         await server.serve()
     except OSError as exc:

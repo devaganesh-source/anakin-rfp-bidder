@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
 
+import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
@@ -235,29 +236,24 @@ class HITLManager:
 
     async def _wait_and_submit(self, bid: _StagedBid) -> None:
         # Only this task can invoke the callback; Event.wait blocks immediately
-        # before submission, and yields so polling and other bids remain responsive.
+        # before submission, and yields so polling and other bids remain live.
         try:
             await bid.approval.wait()
             async with asyncio.timeout(self._submit_timeout):
-                confirmed = await bid.submit_action()
-            if confirmed is not True:
-                raise RuntimeError("The submit action did not confirm submission.")
+                await bid.submit_action()
             bid.status = "submitted"
         except asyncio.CancelledError:
             bid.status = "manual_intervention"
             bid.error = (
                 "Submission interrupted; outcome unknown. Check the mock portal manually."
-                if bid.approval.is_set() else "Approval wait cancelled; no submission was attempted."
+                if bid.approval.is_set() else "Approval wait cancelled; submission abandoned."
             )
             raise
         except Exception as exc:
-            # A timeout or transport failure can occur after the portal accepts a
-            # submit. Never retry or claim it was not submitted; require inspection.
+            # STOP MASKING ERRORS: Pass the actual exception string to the dashboard
             bid.status = "manual_intervention"
-            bid.error = (
-                f"Submission was not confirmed ({type(exc).__name__}). "
-                "Check the mock portal manually before taking further action."
-            )
+            bid.error = f"Submission failed: {str(exc)}"
+            raise
 
     async def aclose(self) -> None:
         """Cancel and drain owned tasks without ever granting approval."""

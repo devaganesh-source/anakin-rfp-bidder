@@ -1,0 +1,3 @@
+Pricing Model:
+Our enterprise license costs $150 per user per month, billed annually.
+Implementation and onboarding require a one-time flat fee of $5,000.
