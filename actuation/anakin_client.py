@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import uuid
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -672,18 +671,6 @@ async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> di
     }
 
 
-def _simulated_staging_receipt(origin: str) -> dict[str, Any]:
-    """Create a review-only receipt when the local portal is temporarily down."""
-    bid_id = uuid.uuid4().hex
-    return {
-        "bid_id": bid_id,
-        "review_url": f"{origin}/bids/{bid_id}/submit",
-        "status": "awaiting_approval",
-        "submitted": False,
-        "simulated": True,
-    }
-
-
 async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") -> dict[str, Any]:
     """Launch Anakin's browser, fill the local draft, and stop at locked review.
 
@@ -698,9 +685,9 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
     review_url reopens that draft for a human. This function neither approves
     nor submits. The portal's /api/bids/{id}/approve gate remains mandatory.
 
-    Invalid input raises ValueError before network I/O. A fully unreachable
-    local portal returns a simulated review receipt; other operational failures
-    raise AnakinStageError and may leave a partial draft.
+    Invalid input raises ValueError before network I/O. An unreachable local
+    portal raises MockPortalUnavailableError; other operational failures raise
+    AnakinStageError and may leave a partial draft.
     """
     origins = _mock_origins(portal_url)
     origin = origins[0]
@@ -731,12 +718,8 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                     await browser.call("Page.setLifecycleEventsEnabled", {"enabled": True})
                     await browser.call("Fetch.enable")
                     return await _fill_mock_forms(browser, values)
-    except MockPortalUnavailableError as exc:
-        LOGGER.warning(
-            "Mock portal unavailable after %d attempts per local host; continuing with a simulated staged review: %s",
-            PORTAL_NAVIGATION_ATTEMPTS, exc,
-        )
-        return _simulated_staging_receipt(origin)
+    except MockPortalUnavailableError:
+        raise
     except asyncio.TimeoutError:
         raise AnakinStageError("Staging exceeded its time limit.") from None
     except aiohttp.ClientResponseError as exc:
