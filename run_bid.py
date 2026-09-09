@@ -111,13 +111,14 @@ def _make_submit_action(staged_bid: dict[str, Any], answers: list[dict[str, str]
                     token = _hidden_value(document, "token")
                     revision = _hidden_value(document, "revision")
                     
+                    # 2. FIRE THE FINAL SUBMISSION
                     submit_url = urljoin(review_url, f"/bids/{portal_bid_id}/submit")
                     async with session.post(
                         submit_url,
                         data={"token": token, "revision": revision},
                         allow_redirects=False,
                     ) as submitted:
-                        if submitted.status != 303:
+                        if submitted.status not in (200, 302, 303):
                             raise RuntimeError(f"Mock portal submit returned HTTP {submitted.status}.")
                         location = submitted.headers.get("Location", "")
                         if urljoin(submit_url, location) != review_url:
