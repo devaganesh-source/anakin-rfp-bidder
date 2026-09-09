@@ -477,8 +477,8 @@ class _MockBrowser:
                 "http://127.0.0.1:8000",
                 "http://localhost:8000",
             })
-        # Require an origin boundary: this accepts the root with or without a
-        # slash and its paths, but not lookalike hosts such as 127.0.0.1:80000.
+        
+        # Permit any request whose URL matches the configured mock portal root or starts with the mock portal origin + `/`
         is_allowed_mock_url = isinstance(url, str) and any(
             url == base or url.startswith(base + "/")
             for base in portal_origins

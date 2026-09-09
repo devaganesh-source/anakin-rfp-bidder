@@ -36,9 +36,9 @@ def load_and_chunk_docs(sample_data_dir: Path) -> list[str]:
                 elif content.strip():
                     chunks.append(content.strip())
                     
-    # Fallback if no files match
+    # Replace with a fatal error:
     if not chunks:
-        chunks.append("Default fallback context: No reference documentation found.")
+        raise RuntimeError("FATAL: Knowledge base is empty. Add .txt or .md files to sample-data/ to proceed.")
         
     return chunks
 

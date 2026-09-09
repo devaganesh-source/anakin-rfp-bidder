@@ -162,24 +162,84 @@ async def run_pipeline() -> BidSnapshot:
     load_dotenv(project_root / ".env")
     _, anakin_api_key, portal_url, rfp_source_url = _required_environment()
 
+    # 1. CRAWL THE RFP
     crawler = RFPCrawler(rfp_source_url)
-    rfp_html = await crawler.fetch_html()
-    RFP_SECTIONS = crawler.parse_rfp(crawler.clean_dom(rfp_html))
+    RFP_SECTIONS = await crawler.crawl()
     print(f"DEBUG: Scraped {len(RFP_SECTIONS)} sections from RFP.")
 
+    # 2. LOAD KNOWLEDGE BASE
     chunks = load_and_chunk_docs(project_root / "sample-data")
     faiss_index = build_index(chunks)
 
-    # Retrieval is performed once, then all Groq section requests run concurrently.
-    answers = await process_all_sections(RFP_SECTIONS, faiss_index, chunks)
-    proposal_answers = [dict(answer) for answer in answers]
+    # 3. GENERATE BATCHED AI ANSWERS (WITH SELF-HEALING RATE LIMIT LOGIC)
+    print("DEBUG: AI Reasoning Phase (Groq - Throttled Batches)...")
+    answers = []
+    items = list(RFP_SECTIONS.items())
+    batch_size = 2  # Reduced to protect TPM limit
+    
+    for i in range(0, len(items), batch_size):
+        batch = dict(items[i:i + batch_size])
+        print(f"-> Processing batch {i // batch_size + 1} of {(len(items) + batch_size - 1) // batch_size}...")
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                batch_answers = await process_all_sections(batch, faiss_index, chunks)
+                answers.extend(batch_answers)
+                break
+            except Exception as exc:
+                if "429" in str(exc) and attempt < max_retries - 1:
+                    print(f"   [!] Groq TPM limit reached. Backing off for 12 seconds (Attempt {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(12)
+                else:
+                    raise exc
+                    
+        if i + batch_size < len(items):
+            await asyncio.sleep(5)
+    
+    proposal_answers = [dict(a) for a in answers]
 
-    staged = await stage_bid(portal_url, proposal_answers, anakin_api_key)
-    submit_action = _make_submit_action(staged, proposal_answers)
+    # --- THE SPLIT HANDOFF ---
+    print("DEBUG: Performing split handoff for legacy mock portal routing...")
+    
+    # 1. Prepare the legacy payload for the robot browser
+    # The Mock Portal HTML form still only has 3 input boxes. We must aggregate
+    # the answers so the headless browser knows where to type them.
+    mapped_answers_dict = {
+        "Security": [],
+        "Tech Specs": [],
+        "Pricing": []
+    }
+
+    for item in proposal_answers:
+        key = item["section"]
+        val = item["answer"]
+        key_upper = key.upper()
+        
+        # Heuristic routing based on section title keywords
+        if any(kw in key_upper for kw in ("SEC", "SECURITY", "COMPLIANCE", "AUDIT", "ACCESS", "AUTH", "SSO")):
+            mapped_answers_dict["Security"].append(f"[{key}]: {val}")
+        elif any(kw in key_upper for kw in ("PRICE", "PRICING", "COST", "COMMERCIAL", "FEE")):
+            mapped_answers_dict["Pricing"].append(f"[{key}]: {val}")
+        else:
+            # Default everything else to Tech Specs
+            mapped_answers_dict["Tech Specs"].append(f"[{key}]: {val}")
+
+    legacy_browser_payload = [
+        {"section": k, "answer": "\n\n".join(v) if v else "Not explicitly requested in this RFP."}
+        for k, v in mapped_answers_dict.items()
+    ]
+
+    # 4. STAGE AND REGISTER
+    # We pass the aggregated 3-field payload to the robot browser so it doesn't crash on invalid form fields
+    staged = await stage_bid(portal_url, legacy_browser_payload, anakin_api_key)
+    submit_action = _make_submit_action(staged, legacy_browser_payload)
+    
+    # But we pass the raw, full 16-item payload to the Next.js UI!
     return await manager.register_staged_bid(
         staged,
-        RFP_SECTIONS,
-        proposal_answers,
+        RFP_SECTIONS,        # Dynamic, unadulterated requirements
+        proposal_answers,    # Dynamic, unadulterated answers
         submit_action,
     )
 

@@ -227,9 +227,8 @@ async def bid_state(bid_id: str) -> dict:
 async def review(bid_id: str) -> HTMLResponse:
     bid = bids.get(bid_id)
     if bid is None:
-        # Keep the fallback on the same rendering path as a staged bid. The
-        # complete answers make the approval controls visible in the demo.
-        bid = create_demo_bid(bid_id)
+        raise HTTPException(status_code=404, detail=f"Bid ID {bid_id} not found")
+        
     content = "".join(
         f'<section class="mb-4 rounded-xl border border-slate-800 bg-slate-950/60 p-5 last:mb-0 sm:p-6"><div class="mb-3 flex items-center justify-between gap-3"><h2 class="text-lg font-semibold text-white">{title}</h2><span class="rounded-md border border-slate-800 bg-slate-900 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">Review</span></div><pre class="text-sm leading-7 text-slate-300" id="review_{input_id}">'
         f'{escape(bid.answers.get(title, "Not provided"))}</pre></section>'

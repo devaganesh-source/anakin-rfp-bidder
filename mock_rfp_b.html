@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian Health Network - Clinical Document Automation RFP</title>
+</head>
+<body>
+  <header>
+    <h1>Meridian Health Network Supplier Portal</h1>
+  </header>
+  <nav>Home | Solicitations | Vendor policies</nav>
+  <main>
+    <h2>REQUEST FOR PROPOSAL MHN-2026-88</h2>
+    <p><strong>On-Premises Clinical Document Automation Platform</strong></p>
+
+    <h3>1. Overview / General Instructions</h3>
+    <p>Meridian Health Network seeks software for clinical document workflows across its hospitals. The production system must run inside Meridian-managed data centers rather than in a vendor public cloud.</p>
+
+    <h2>Mandatory Healthcare Security Controls</h2>
+    <table>
+      <tr><th>Item Ref</th><th>Requirement Text</th></tr>
+      <tr><td>SEC-01</td><td>The vendor must demonstrate HIPAA compliance, sign a Business Associate Agreement, and describe safeguards for protected health information.</td></tr>
+      <tr><td>SEC-02</td><td>Protected health information must use TLS 1.3 in transit and AES-256 at rest, with customer-managed keys supplied through Azure Key Vault.</td></tr>
+      <tr><td>SEC-03</td><td>Provide audit records suitable for HIPAA access investigations, including patient-record views, exports, emergency-access events, and administrator activity.</td></tr>
+      <tr><td>SEC-04</td><td>Access controls must separate clinical content authors, reviewers, approvers, and administrators, with a custom permission matrix for each hospital workspace.</td></tr>
+    </table>
+
+    <h3>TECHNICAL ENVIRONMENT</h3>
+    <p>The complete platform must be deployable on-premises on Meridian-managed Kubernetes clusters with no dependency on a vendor-hosted control plane or public-cloud service.</p>
+
+    <h2>Document Ingestion</h2>
+    <p>The system must ingest HTML and plain-text policy files and preserve exact source attribution so compliance reviewers can trace each generated answer to its supporting passage.</p>
+
+    <p><strong>Human Approval Before Submission:</strong> A Meridian procurement employee must review the staged response and explicitly approve it before the mock bid can be submitted.</p>
+
+    <h3>Response Quality and Traceability</h3>
+    <p>Each generated answer must include an inline citation to internal source material, and unsupported claims must be flagged or routed for manual completion.</p>
+
+    <p><strong>Deployment and Data Location.</strong> All application services, indexes, backups, telemetry, and encryption keys must remain inside Meridian facilities, including during upgrades and support investigations.</p>
+
+    <h2>Pricing submission notes</h2>
+    <p>Quote a fixed annual site license for each hospital with unlimited users and documents. Do not propose per-user charges. List appliance, implementation, and optional training fees separately.</p>
+
+    <h3>Vendor Support</h3>
+    <p>Provide 24/7 ticket and email support, a dedicated customer success manager, a one-hour response commitment for critical issues, and maintenance notice 72 hours in advance.</p>
+
+    <table>
+      <tr><th>Item Ref</th><th>Requirement Text</th></tr>
+      <tr><td>SUB-01</td><td>Upload the technical response as a DOCX file.</td></tr>
+      <tr><td>SUB-02</td><td>Keep all confidential pricing separate from the technical response.</td></tr>
+      <tr><td>SUB-03</td><td>Provide a sample Business Associate Agreement and a bill of materials for the on-premises deployment.</td></tr>
+    </table>
+  </main>
+  <footer>Copyright Meridian Health Network.</footer>
+</body>
+</html>
