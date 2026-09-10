@@ -59,7 +59,7 @@ class RFPCrawler:
         return soup
 
     def parse_rfp(self, dom: BeautifulSoup | None = None) -> dict[str, str]:
-        """Extract requirements using table, sibling, and inline-title heuristics."""
+        """Extract requirements using table, list, sibling, and inline-title heuristics."""
         soup = dom if dom is not None else self.dom
         if soup is None:
             raise RuntimeError("Clean the DOM before parsing the RFP.")
@@ -116,6 +116,30 @@ class RFPCrawler:
                 heading.get_text(" ", strip=True),
                 sibling.get_text(" ", strip=True),
             )
+
+        # Heuristic 4: emit every list item separately. Restrict each item's text
+        # to content owned by that <li> so nested child items are not duplicated.
+        list_item_number = 0
+        for list_element in soup.find_all(["ul", "ol"]):
+            for item in list_element.find_all("li", recursive=False):
+                item_text = self._normalise(
+                    " ".join(
+                        str(text)
+                        for text in item.find_all(string=True)
+                        if text.find_parent("li") is item
+                    )
+                )
+                if not item_text:
+                    continue
+
+                list_item_number += 1
+                heading = item.find_previous(["h1", "h2", "h3", "h4", "h5", "h6"])
+                heading_text = (
+                    heading.get_text(" ", strip=True)
+                    if isinstance(heading, Tag)
+                    else "List requirement"
+                )
+                add_requirement(f"{heading_text} - Item {list_item_number}", item_text)
 
         return requirements
 
