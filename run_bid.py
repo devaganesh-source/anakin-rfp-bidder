@@ -168,6 +168,9 @@ async def run_pipeline() -> BidSnapshot:
     RFP_SECTIONS = await crawler.crawl()
     print(f"DEBUG: Scraped {len(RFP_SECTIONS)} sections from RFP.")
 
+    for idx, (title, content) in enumerate(RFP_SECTIONS.items()):
+        print(f"[{idx}] {title}: {content[:60]}...")
+
     # 2. LOAD KNOWLEDGE BASE
     chunks = load_and_chunk_docs(project_root / "sample-data")
     faiss_index = build_index(chunks)
