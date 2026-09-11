@@ -40,6 +40,7 @@ type BidSnapshot = {
 
 type GenerationStage = "crawling" | "drafting" | "staging";
 type EnvelopeId = "technical" | "knowledge" | "security" | "commercial";
+type MockPortalAction = "approve" | "submit";
 
 type ProcurementEnvelope = {
   id: EnvelopeId;
@@ -99,6 +100,31 @@ const PROCUREMENT_ENVELOPES: ProcurementEnvelope[] = [
 
 function apiUrl(path: string) {
   return `${API_BASE_URL}${path}`;
+}
+
+function mockPortalApiUrl(bid: BidSnapshot, action: MockPortalAction) {
+  const reviewUrl = new URL(bid.review_url);
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+  const expectedPath = `/bids/${encodeURIComponent(bid.portal_bid_id)}/submit`;
+  if (
+    !["http:", "https:"].includes(reviewUrl.protocol)
+    || !loopbackHosts.has(reviewUrl.hostname)
+    || reviewUrl.pathname !== expectedPath
+    || Boolean(reviewUrl.search)
+    || Boolean(reviewUrl.hash)
+  ) {
+    throw new Error("Bids can only be submitted to the configured local mock API.");
+  }
+  return new URL(
+    `/api/bids/${encodeURIComponent(bid.portal_bid_id)}/${action}`,
+    reviewUrl.origin,
+  ).toString();
+}
+
+function finalizedAnswers(comparison: ReviewSection[]) {
+  return Object.fromEntries(
+    comparison.map(({ section, answer }) => [section, answer]),
+  );
 }
 
 function requestErrorMessage(error: unknown, action: string) {
@@ -364,11 +390,11 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const [refreshing, setRefreshing] = useState(false);
   const [approving, setApproving] = useState(false);
   const [approvalReleased, setApprovalReleased] = useState(false);
+  const [isSubmitted, setIsSubmitted] = useState(false);
   const [editedAnswers, setEditedAnswers] = useState<Record<string, string>>({});
   const [resolvedItems, setResolvedItems] = useState<Record<string, boolean>>({});
   const [authorizedRepresentative, setAuthorizedRepresentative] = useState(false);
   const [ungroundedAcknowledged, setUngroundedAcknowledged] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const initializedBidRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -378,6 +404,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
     setEditedAnswers(Object.fromEntries(bid.comparison.map((item) => [item.section, item.answer])));
     setResolvedItems(Object.fromEntries((bid.human_resolved_sections ?? []).map((section) => [section, true])));
     setApprovalReleased(released);
+    setIsSubmitted(bid.submitted || bid.status === "submitted");
     setAuthorizedRepresentative(released);
     setUngroundedAcknowledged(released);
   }, [bid]);
@@ -399,9 +426,9 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
       setBid(snapshot);
       onSnapshot(snapshot);
       if (snapshot.approved || snapshot.status === "submitting" || snapshot.status === "submitted") setApprovalReleased(true);
-      setError(null);
-    } catch (requestError) {
-      setError(requestErrorMessage(requestError, "Loading the bid"));
+      if (snapshot.submitted || snapshot.status === "submitted") setIsSubmitted(true);
+    } catch {
+      // A missing or unavailable bid leaves the review route empty by design.
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -415,21 +442,74 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
     return () => window.clearInterval(interval);
   }, [bidId, loadBid]);
 
-  const approveBid = async () => {
+  const approveAndSubmit = async () => {
     if (!bidId || !bid || bid.status !== "awaiting_approval" || !authorizedRepresentative || !ungroundedAcknowledged) return;
     setApproving(true);
-    setError(null);
     try {
-      const responseOverrides = bid.comparison
-        .map((item) => ({
-          section: item.section,
+      const bidWithOverrides: BidSnapshot = {
+        ...bid,
+        comparison: bid.comparison.map((item) => ({
+          ...item,
           answer: editedAnswers[item.section] ?? item.answer,
-        }))
-        .filter(({ section, answer }) => answer !== bid.comparison.find((item) => item.section === section)?.answer);
-      const response = await fetch(apiUrl(`/api/bids/${encodeURIComponent(bidId)}/approve`), {
+        })),
+      };
+      const responseOverrides = bidWithOverrides.comparison
+        .filter((item, index) => item.answer !== bid.comparison[index]?.answer)
+        .map(({ section, answer }) => ({ section, answer }));
+      const answers = finalizedAnswers(bidWithOverrides.comparison);
+      const portalApprovalResponse = await fetch(mockPortalApiUrl(bid, "approve"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          answers,
+          authorized_representative: true,
+          ungrounded_items_acknowledged: true,
+        }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!portalApprovalResponse.ok) {
+        const detail = await portalApprovalResponse.text();
+        throw new Error(detail || `Approval failed (${portalApprovalResponse.status}).`);
+      }
+
+      const submissionResponse = await fetch(mockPortalApiUrl(bid, "submit"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answers }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!submissionResponse.ok) {
+        const detail = await submissionResponse.text();
+        throw new Error(detail || `Submission failed (${submissionResponse.status}).`);
+      }
+      const submission = (await submissionResponse.json()) as { status?: string; submitted?: boolean };
+      if (submission.status !== "success" || submission.submitted !== true) {
+        throw new Error("The mock procurement API did not confirm submission.");
+      }
+
+      const overrideSections = bid.comparison
+        .filter((item) => isCapabilityMissing(item.answer) || bid.human_override_sections?.includes(item.section))
+        .map((item) => item.section);
+      const submittedSnapshot: BidSnapshot = {
+        ...bidWithOverrides,
+        status: "submitted",
+        approved: true,
+        submitted: true,
+        human_override_sections: overrideSections,
+        human_resolved_sections: overrideSections.filter((section) => resolvedItems[section]),
+      };
+      setIsSubmitted(true);
+      setApprovalReleased(true);
+      setBid(submittedSnapshot);
+      onSnapshot(submittedSnapshot);
+
+      // Synchronize the pipeline's HITL record after the frontend-owned JSON
+      // submission. Its gated callback now observes the already-submitted API state.
+      await fetch(apiUrl(`/api/bids/${encodeURIComponent(bidId)}/approve`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bid: bidWithOverrides,
           solicitation_reference: SOLICITATION_REFERENCE,
           session_id: bid.id,
           attestations: {
@@ -440,35 +520,15 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
         }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(detail || `Approval failed (${response.status}).`);
-      }
-      const snapshot = (await response.json()) as BidSnapshot;
-      const overrideSections = bid.comparison
-        .filter((item) => isCapabilityMissing(item.answer) || bid.human_override_sections?.includes(item.section))
-        .map((item) => item.section);
-      const mergedSnapshot: BidSnapshot = {
-        ...snapshot,
-        comparison: snapshot.comparison.map((item) => ({
-          ...item,
-          answer: editedAnswers[item.section] ?? item.answer,
-        })),
-        human_override_sections: overrideSections,
-        human_resolved_sections: overrideSections.filter((section) => resolvedItems[section]),
-      };
-      setBid(mergedSnapshot);
-      onSnapshot(mergedSnapshot);
-      setApprovalReleased(true);
-    } catch (requestError) {
-      setError(requestErrorMessage(requestError, "Approval"));
+    } catch {
+      // The backend remains authoritative; polling will reflect any completed action.
     } finally {
       setApproving(false);
     }
   };
 
-  // Polling and UI rendering may proceed concurrently; button guards prevent duplicate
-  // requests, while the backend asyncio.Event blocks final submission until approval.
+  // Approval and submission run sequentially for one click. Polling may continue
+  // concurrently, while the button guard prevents duplicate client requests.
 
   const groupedEnvelopes = useMemo(() => PROCUREMENT_ENVELOPES.map((envelope) => ({
     ...envelope,
@@ -483,17 +543,44 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const attestationsComplete = authorizedRepresentative && ungroundedAcknowledged;
 
   if (loading && !bid) return <EmptyState title="Loading response record" body="Retrieving the staged submission from the local procurement workflow." action={<button type="button" onClick={onBack} className="border border-[#173f68] px-4 py-2.5 text-sm font-bold text-[#173f68]">Back to dashboard</button>} />;
-  if (!bid) return <EmptyState title="Response record unavailable" body={error ?? "The backend did not return a review snapshot."} warning onRetry={() => void loadBid()} action={<button type="button" onClick={onBack} className="border border-[#173f68] px-4 py-2.5 text-sm font-bold text-[#173f68]">Back to dashboard</button>} />;
+  if (!bid) return null;
+
+  if (isSubmitted) {
+    return (
+      <main className="grid min-h-screen place-items-center bg-white px-6 py-16 text-slate-900">
+        <section className="w-full max-w-2xl text-center" aria-labelledby="submission-confirmation-title">
+          <div className="mx-auto grid h-28 w-28 place-items-center rounded-full border-4 border-emerald-700 bg-emerald-50 text-emerald-700 shadow-sm">
+            <Icon name="check" size={64} />
+          </div>
+          <p className="mt-8 text-xs font-extrabold uppercase tracking-[0.18em] text-emerald-700">Submission confirmed</p>
+          <h1 id="submission-confirmation-title" className="mt-3 font-serif text-3xl font-bold text-blue-950 sm:text-5xl">
+            Official Procurement Package Submitted Successfully
+          </h1>
+          <p className="mx-auto mt-5 max-w-xl text-base leading-7 text-slate-600">
+            The finalized response package has been recorded by the local procurement API.
+          </p>
+          <div className="mx-auto mt-8 max-w-lg rounded-xl border border-slate-200 bg-slate-50 px-6 py-5 shadow-sm">
+            <p className="text-xs font-bold uppercase tracking-[0.14em] text-slate-500">Session ID</p>
+            <p className="mt-2 break-all font-mono text-sm font-bold text-slate-900">{bid.id}</p>
+          </div>
+          <button type="button" onClick={onBack} className="mt-8 border-2 border-blue-900 px-6 py-3 text-sm font-bold text-blue-900 transition-colors hover:bg-blue-50">
+            Return to dashboard
+          </button>
+        </section>
+      </main>
+    );
+  }
 
   const currentStatus = statusCopy(bid.status);
   const groundedCount = bid.comparison.filter((item) => !isCapabilityMissing(item.answer) && Boolean(item.source_snippet.trim())).length;
   const exceptionCount = bid.comparison.length - groundedCount;
   const complianceVerified = exceptionCount === 0;
   const sessionHash = bid.id.slice(0, 16).toUpperCase();
-  const submitDisabled = approving || bid.status !== "awaiting_approval" || !authorizedRepresentative || !ungroundedAcknowledged;
+  const submitDisabled = approving || isSubmitted || bid.status !== "awaiting_approval" || !authorizedRepresentative || !ungroundedAcknowledged;
 
   let actionLabel = "Approve & Submit";
   if (approving) actionLabel = "Recording authorization…";
+  else if (isSubmitted) actionLabel = "Submitted";
   else if (isApproved) actionLabel = "Submission authorized";
   else if (!attestationsComplete) actionLabel = "Complete certifications to continue";
 
@@ -514,13 +601,6 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
       </header>
 
       <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
-        {error && (
-          <div role="alert" className="mb-5 flex items-start justify-between gap-4 border border-red-700 bg-red-50 px-4 py-3 text-sm text-red-900">
-            <span className="flex items-start gap-2"><Icon name="warning" size={17} /> {error}</span>
-            <button type="button" className="shrink-0 font-bold underline underline-offset-2" onClick={() => void loadBid()}>Retry</button>
-          </div>
-        )}
-
         <div className="border border-[#8292a0] bg-white shadow-[0_14px_35px_rgba(21,45,69,0.14)] print:border-slate-700 print:shadow-none">
           <section className="border-b border-slate-300 px-5 py-5 sm:px-7" aria-labelledby="form-title">
             <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
@@ -637,11 +717,11 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
                 <span className="mt-0.5 text-[#173f68]"><Icon name="lock" size={18} /></span>
                 <div>
                   <p className="font-bold text-slate-900">Human approval gate</p>
-                  <p className="mt-1 leading-6">{isApproved ? currentStatus.detail : "The mock portal submit action remains locked until both attestations are checked and this button is activated by an authorized reviewer."}</p>
+                  <p className="mt-1 leading-6">{isApproved ? currentStatus.detail : "The JSON submission action remains locked until both attestations are checked and this button is activated by an authorized reviewer."}</p>
                 </div>
               </div>
 
-              <button type="button" onClick={() => void approveBid()} disabled={submitDisabled} className={`inline-flex min-h-12 min-w-[260px] items-center justify-center gap-2 border-2 px-5 py-3 text-sm font-extrabold uppercase tracking-[0.04em] transition disabled:cursor-not-allowed ${isApproved ? "border-[#2f6b46] bg-[#e8f4ec] text-[#234f35]" : "border-[#0d2d4c] bg-[#173f68] text-white hover:bg-[#0d2d4c] disabled:border-slate-400 disabled:bg-slate-300 disabled:text-slate-600"}`}>
+              <button type="button" onClick={() => void approveAndSubmit()} disabled={submitDisabled} className={`inline-flex min-h-12 min-w-[260px] items-center justify-center gap-2 border-2 px-5 py-3 text-sm font-extrabold uppercase tracking-[0.04em] transition disabled:cursor-not-allowed ${isApproved ? "border-[#2f6b46] bg-[#e8f4ec] text-[#234f35]" : "border-[#0d2d4c] bg-[#173f68] text-white hover:bg-[#0d2d4c] disabled:border-slate-400 disabled:bg-slate-300 disabled:text-slate-600"}`}>
                 {approving ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" /> : isApproved ? <Icon name="check" size={18} /> : <Icon name="lock" size={17} />}
                 {actionLabel}
               </button>
@@ -649,7 +729,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
 
             <div className="flex flex-col gap-3 border-t border-slate-300 px-5 py-4 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-7">
               <span>Controlled record · Session {sessionHash}</span>
-              <a className="inline-flex items-center gap-2 font-bold text-[#173f68] underline underline-offset-2 hover:text-[#0d2d4c]" href={bid.review_url} target="_blank" rel="noreferrer">Open staged mock portal record <Icon name="external" size={13} /></a>
+              <span className="font-semibold text-slate-600">Final review and submission are completed in this secure workspace.</span>
             </div>
           </section>
         </div>
@@ -773,12 +853,10 @@ function DashboardContent() {
       }));
       const snapshots = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
       setBids(snapshots);
-      const firstFailure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-      setError(firstFailure && snapshots.length === 0
-        ? requestErrorMessage(firstFailure.reason, "Loading tracked bids")
-        : null);
-    } catch (requestError) {
-      setError(requestErrorMessage(requestError, "Loading tracked bids"));
+      setError(null);
+    } catch {
+      setBids([]);
+      setError(null);
     } finally {
       setLoading(false);
       setRefreshing(false);

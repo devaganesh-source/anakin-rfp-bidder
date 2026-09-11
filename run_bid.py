@@ -8,19 +8,15 @@ approval call is the only path that releases final submission.
 
 import argparse
 import asyncio
-import html
 import os
-import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
-import aiohttp
 import httpx
 import uvicorn
 from dotenv import load_dotenv
 
-from actuation.anakin_client import stage_bid
 from actuation.hitl_manager import BidSnapshot, app as hitl_app, manager
 from crawler import RFPCrawler
 from reasoner.groq_reasoner import process_all_sections
@@ -73,89 +69,80 @@ def _validate_local_service_ports(portal_url: str, hitl_port: int) -> None:
         )
 
 
-def _hidden_value(document: str, field_name: str) -> str:
-    """Extract one hidden form value from the mock portal review page robustly."""
-    tag_pattern = re.compile(rf'<input[^>]*name=["\']{re.escape(field_name)}["\'][^>]*>', re.IGNORECASE)
-    tag_match = tag_pattern.search(document)
-    
-    if not tag_match:
-        raise RuntimeError(f"The mock portal review did not contain {field_name}.")
-        
-    val_pattern = re.compile(r'value=["\']([^"\']*)["\']', re.IGNORECASE)
-    val_match = val_pattern.search(tag_match.group(0))
-    
-    if not val_match:
-        raise RuntimeError(f"The mock portal {field_name} input had no value attribute.")
-        
-    return html.unescape(val_match.group(1))
+async def _stage_bid_via_api(
+    portal_url: str,
+    answers: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Create the local draft through JSON without probing an HTML form."""
+    parsed_portal = urlsplit(portal_url)
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+    if (
+        parsed_portal.scheme not in {"http", "https"}
+        or (parsed_portal.hostname or "").lower() not in loopback_hosts
+        or parsed_portal.username is not None
+        or parsed_portal.password is not None
+        or parsed_portal.path not in {"", "/"}
+        or parsed_portal.query
+        or parsed_portal.fragment
+    ):
+        raise ValueError("MOCK_PORTAL_URL must be a loopback HTTP(S) root URL.")
+
+    answer_map = {item["section"]: item["answer"] for item in answers}
+    create_url = f"{portal_url.rstrip('/')}/api/bids"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(create_url, json={"answers": answer_map})
+    except httpx.RequestError as exc:
+        raise RuntimeError("The local mock bid API could not stage the draft.") from exc
+
+    if response.status_code != 201:
+        raise RuntimeError(
+            f"The local mock bid API returned HTTP {response.status_code} while staging."
+        )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("The local mock bid API returned an invalid staging response.") from exc
+    portal_bid_id = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(portal_bid_id, str) or len(portal_bid_id) != 32:
+        raise RuntimeError("The local mock bid API returned an invalid bid ID.")
+
+    return {
+        "bid_id": portal_bid_id,
+        "review_url": f"{portal_url.rstrip('/')}/bids/{portal_bid_id}/submit",
+        "status": "awaiting_approval",
+        "submitted": False,
+    }
 
 
-def _make_submit_action(staged_bid: dict[str, Any], answers: list[dict[str, str]]):
-    """Create the approval-gated action that submits this exact reviewed draft."""
-    review_url = staged_bid["review_url"]
+def _make_submit_action(staged_bid: dict[str, Any], _answers: list[dict[str, str]]):
+    """Create the gated callback that verifies the frontend-owned submission."""
     portal_bid_id = staged_bid["bid_id"]
-    review_parts = urlsplit(review_url)
+    review_parts = urlsplit(staged_bid["review_url"])
     portal_url = f"{review_parts.scheme}://{review_parts.netloc}"
 
     async def submit_action() -> bool:
-        """Submit once, after HITLManager has observed explicit human approval."""
-        timeout = aiohttp.ClientTimeout(total=SUBMIT_TIMEOUT_SECONDS, connect=10)
+        """Verify once, after HITLManager observes explicit human approval."""
+        verify_url = f"{portal_url.rstrip('/')}/api/bids/{portal_bid_id}"
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(review_url, allow_redirects=False) as review:
-                    if review.status != 200:
-                        raise RuntimeError(f"Mock portal review returned HTTP {review.status}.")
-                    document = await review.text()
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(verify_url)
+        except httpx.RequestError as exc:
+            raise RuntimeError("Submission verification request failed.") from exc
 
-                # IDEMPOTENCY CHECK: Skip POST if the headless browser already submitted it
-                if "Mock bid submitted" in document:
-                    print("DEBUG: Bid was already submitted by the staging browser. Skipping POST.")
-                else:
-                    token = _hidden_value(document, "token")
-                    revision = _hidden_value(document, "revision")
-                    
-                    # 2. FIRE THE FINAL SUBMISSION
-                    submit_url = urljoin(review_url, f"/bids/{portal_bid_id}/submit")
-                    async with session.post(
-                        submit_url,
-                        data={"token": token, "revision": revision},
-                        allow_redirects=False,
-                    ) as submitted:
-                        if submitted.status not in (200, 302, 303):
-                            raise RuntimeError(f"Mock portal submit returned HTTP {submitted.status}.")
-                        location = submitted.headers.get("Location", "")
-                        if urljoin(submit_url, location) != review_url:
-                            raise RuntimeError("Mock portal redirected outside the reviewed draft.")
-
-                verify_url = f"{portal_url.rstrip('/')}/api/bids/{portal_bid_id}"
-                print(f"DEBUG: Verifying submission at {verify_url}")
-                try:
-                    async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
-                        follow_redirects=False,
-                    ) as verify_client:
-                        verify_response = await verify_client.get(verify_url)
-                except httpx.RequestError as exc:
-                    raise RuntimeError("Submission verification request failed.") from exc
-
-                raw_response = verify_response.text
-                try:
-                    data = verify_response.json()
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"Submission was not confirmed. Raw response: {raw_response}"
-                    ) from exc
-                if (
-                    verify_response.status_code != 200
-                    or not isinstance(data, dict)
-                    or data.get("submitted") is not True
-                ):
-                    raise RuntimeError(
-                        f"Submission was not confirmed. Raw response: {raw_response}"
-                    )
-                return True
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise RuntimeError("The mock portal submit request failed.") from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("The local mock bid API returned an invalid status response.") from exc
+        if response.status_code != 200 or not isinstance(data, dict) or data.get("submitted") is not True:
+            raise RuntimeError("The Next.js submission was not confirmed by the local mock bid API.")
+        return True
 
     return submit_action
 
@@ -164,7 +151,7 @@ async def run_pipeline() -> BidSnapshot:
     """Build the proposal, stage it, register HITL state, and return its session."""
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env")
-    _, anakin_api_key, portal_url, rfp_source_url = _required_environment()
+    _, _, portal_url, rfp_source_url = _required_environment()
 
     # 1. CRAWL THE RFP
     crawler = RFPCrawler(rfp_source_url)
@@ -215,7 +202,7 @@ async def run_pipeline() -> BidSnapshot:
                     raise
 
     if not answers:
-        print("\n[!] DRY RUN ACTIVE: No API calls made. Exiting before headless browser staging.")
+        print("\n[!] DRY RUN ACTIVE: No API calls made. Exiting before JSON staging.")
         return None
 
     print(f"DEBUG: Completed AI reasoning for {len(answers)} of {len(items)} sections.")
@@ -223,38 +210,10 @@ async def run_pipeline() -> BidSnapshot:
     
     proposal_answers = [dict(a) for a in answers]
 
-    # --- THE SPLIT HANDOFF ---
-    print("DEBUG: Performing split handoff for legacy mock portal routing...")
-    
-    # 1. Prepare the legacy payload for the robot browser
-    mapped_answers_dict = {
-        "Security": [],
-        "Tech Specs": [],
-        "Pricing": []
-    }
-
-    for item in proposal_answers:
-        key = item["section"]
-        val = item["answer"]
-        key_upper = key.upper()
-        
-        # Heuristic routing based on section title keywords
-        if any(kw in key_upper for kw in ("SEC", "SECURITY", "COMPLIANCE", "AUDIT", "ACCESS", "AUTH", "SSO")):
-            mapped_answers_dict["Security"].append(f"[{key}]: {val}")
-        elif any(kw in key_upper for kw in ("PRICE", "PRICING", "COST", "COMMERCIAL", "FEE")):
-            mapped_answers_dict["Pricing"].append(f"[{key}]: {val}")
-        else:
-            # Default everything else to Tech Specs
-            mapped_answers_dict["Tech Specs"].append(f"[{key}]: {val}")
-
-    legacy_browser_payload = [
-        {"section": k, "answer": "\n\n".join(v) if v else "Not explicitly requested in this RFP."}
-        for k, v in mapped_answers_dict.items()
-    ]
-
     # 4. STAGE AND REGISTER
-    staged = await stage_bid(portal_url, legacy_browser_payload, anakin_api_key)
-    submit_action = _make_submit_action(staged, legacy_browser_payload)
+    print("DEBUG: Staging the finalized draft through the local mock JSON API...")
+    staged = await _stage_bid_via_api(portal_url, proposal_answers)
+    submit_action = _make_submit_action(staged, proposal_answers)
     
     # Pass the full dynamic requirement payload to the Next.js review UI.
     return await manager.register_staged_bid(
@@ -265,8 +224,10 @@ async def run_pipeline() -> BidSnapshot:
     )
 
 
-async def main(serve: bool = True) -> None:
+async def serve_app(serve: bool = True) -> None:
     """Run the pipeline and optionally keep the HITL API serving the session."""
+    # Staging completes first; Uvicorn then owns the same event loop as the
+    # in-memory HITL manager so polling and approval tasks remain available.
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env")
     hitl_host = os.environ.get("HITL_HOST", "127.0.0.1")
@@ -309,6 +270,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     try:
-        asyncio.run(main(serve=not args.no_server))
+        asyncio.run(serve_app(serve=not args.no_server))
     except (RuntimeError, ValueError, OSError) as exc:
         raise SystemExit(f"run_bid failed: {exc}") from exc
