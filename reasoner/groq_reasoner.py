@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from typing import TypedDict
 
 import faiss
+import groq
 from groq import APIError, APIStatusError, APITimeoutError, AsyncGroq
 from pydantic import BaseModel, Field, ValidationError
 
@@ -220,32 +221,47 @@ async def generate_section_answer(
     selected_format = formatting_instruction or random.choice(FORMATTING_INSTRUCTIONS)
 
     try:
-        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
-            async with AsyncGroq(
-                api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=2
-            ) as client:
-                completion = await client.chat.completions.create(
-                    model=MODEL,
-                    # JSON mode constrains syntax; Pydantic enforces the exact schema afterward.
-                    response_format={"type": "json_object"},
-                    temperature=0,
-                    messages=[
-                        {"role": "system", "content": _system_prompt(selected_format)},
-                        {
-                            "role": "user",
-                            "content": json.dumps(
+        async with AsyncGroq(
+            api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0
+        ) as client:
+            for attempt in range(3):
+                try:
+                    async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+                        completion = await client.chat.completions.create(
+                            model=MODEL,
+                            # JSON mode constrains syntax; Pydantic enforces the exact schema afterward.
+                            response_format={"type": "json_object"},
+                            temperature=0,
+                            messages=[
+                                {"role": "system", "content": _system_prompt(selected_format)},
                                 {
-                                    "section_title": section_title,
-                                    "section_text": section_text,
-                                    "retrieved_context": context,
+                                    "role": "user",
+                                    "content": json.dumps(
+                                        {
+                                            "section_title": section_title,
+                                            "section_text": section_text,
+                                            "retrieved_context": context,
+                                        },
+                                        ensure_ascii=False,
+                                    ),
                                 },
-                                ensure_ascii=False,
-                            ),
-                        },
-                    ],
-                )
+                            ],
+                        )
+                    break
+                except groq.RateLimitError:
+                    if attempt == 2:
+                        raise
+                    backoff = 15 * (2**attempt)
+                    print(
+                        f"[RATE LIMIT] 429 encountered for '{section_title}'. "
+                        f"Backing off for {backoff} seconds "
+                        f"(Attempt {attempt + 1}/3)..."
+                    )
+                    await asyncio.sleep(backoff)
     except (APITimeoutError, asyncio.TimeoutError) as exc:
         raise GroqReasonerError("Groq section generation timed out.", "GROQ_TIMEOUT") from exc
+    except groq.RateLimitError:
+        raise
     except APIStatusError as exc:
         # Captured full server-side response body to surface 400 errors properly
         error_detail = getattr(exc, "response", None)

@@ -35,7 +35,6 @@ COMPLIANCE_MARKDOWN_URL = "https://vercel.com/docs/security/compliance.md"
 STATUS_SUMMARY_URL = "https://www.vercel-status.com/api/v2/summary.json"
 LIVE_FETCH_TIMEOUT_SECONDS = 30
 SUBMIT_TIMEOUT_SECONDS = 30
-GROQ_CONCURRENCY_LIMIT = 5
 
 
 def fetch_live_evidence() -> dict:
@@ -263,15 +262,16 @@ async def process_section_concurrently(
     semaphore: asyncio.Semaphore,
 ) -> dict[str, str]:
     """Retrieve evidence and reason over one section within the shared limit."""
-    # Section retrieval and AsyncGroq calls run concurrently in at most five
-    # slots; the HITL approval Event still blocks final submission afterward.
+    retrieved_context = await asyncio.to_thread(
+        search_index,
+        f"{title}\n{content}",
+        faiss_index,
+        chunks,
+    )
+
+    # Limit only the external Groq requests; local evidence retrieval can still
+    # run concurrently while final submission remains blocked by HITL approval.
     async with semaphore:
-        retrieved_context = await asyncio.to_thread(
-            search_index,
-            f"{title}\n{content}",
-            faiss_index,
-            chunks,
-        )
         return await generate_section_answer(title, content, retrieved_context)
 
 
@@ -299,7 +299,7 @@ async def run_pipeline() -> BidSnapshot:
 
     # 3. GENERATE AI ANSWERS WITH BOUNDED CONCURRENCY
     items = list(RFP_SECTIONS.items())
-    semaphore = asyncio.Semaphore(GROQ_CONCURRENCY_LIMIT)
+    semaphore = asyncio.Semaphore(2)
     tasks = [
         process_section_concurrently(
             title,
