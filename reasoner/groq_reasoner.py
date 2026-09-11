@@ -224,7 +224,7 @@ async def generate_section_answer(
         async with AsyncGroq(
             api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0
         ) as client:
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
                         completion = await client.chat.completions.create(
@@ -249,13 +249,13 @@ async def generate_section_answer(
                         )
                     break
                 except groq.RateLimitError:
-                    if attempt == 2:
+                    if attempt == 4:
                         raise
-                    backoff = 15 * (2**attempt)
+                    backoff = 40
                     print(
                         f"[RATE LIMIT] 429 encountered for '{section_title}'. "
-                        f"Backing off for {backoff} seconds "
-                        f"(Attempt {attempt + 1}/3)..."
+                        f"Waiting {backoff}s for token bucket to reset "
+                        f"(Attempt {attempt + 1}/5)..."
                     )
                     await asyncio.sleep(backoff)
     except (APITimeoutError, asyncio.TimeoutError) as exc:

@@ -299,7 +299,7 @@ async def run_pipeline() -> BidSnapshot:
 
     # 3. GENERATE AI ANSWERS WITH BOUNDED CONCURRENCY
     items = list(RFP_SECTIONS.items())
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(1)
     tasks = [
         process_section_concurrently(
             title,
