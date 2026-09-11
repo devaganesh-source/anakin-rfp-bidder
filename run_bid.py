@@ -8,7 +8,9 @@ approval call is the only path that releases final submission.
 
 import argparse
 import asyncio
+import datetime
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,17 +19,123 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 
+try:
+    import requests
+except ModuleNotFoundError:  # Keep the script runnable in the minimal project venv.
+    requests = httpx
+
 from actuation.hitl_manager import BidSnapshot, app as hitl_app, manager
 from crawler import RFPCrawler
-from reasoner.groq_reasoner import process_all_sections
-from reasoner.vector_store import build_index, load_and_chunk_docs
+from reasoner.groq_reasoner import generate_section_answer
+from reasoner.vector_store import build_index, search_index
 from start_backend import ensure_port_available
 
 
+COMPLIANCE_MARKDOWN_URL = "https://vercel.com/docs/security/compliance.md"
+STATUS_SUMMARY_URL = "https://www.vercel-status.com/api/v2/summary.json"
+LIVE_FETCH_TIMEOUT_SECONDS = 30
 SUBMIT_TIMEOUT_SECONDS = 30
-GROQ_BATCH_SIZE = 1
-GROQ_429_MAX_ATTEMPTS = 3
-GROQ_429_INITIAL_BACKOFF_SECONDS = 15
+GROQ_CONCURRENCY_LIMIT = 5
+
+
+def fetch_live_evidence() -> dict:
+    """Fetch uncached compliance and operational evidence from live endpoints."""
+    headers = {"Cache-Control": "no-cache"}
+    redirect_option = (
+        {"follow_redirects": False}
+        if requests is httpx
+        else {"allow_redirects": False}
+    )
+    request_error = (
+        httpx.HTTPError
+        if requests is httpx
+        else requests.exceptions.RequestException
+    )
+
+    print("[LIVE FETCH] Fetching compliance.md live...")
+    request_started = time.perf_counter()
+    try:
+        compliance_response = requests.get(
+            COMPLIANCE_MARKDOWN_URL,
+            headers=headers,
+            timeout=LIVE_FETCH_TIMEOUT_SECONDS,
+            **redirect_option,
+        )
+        req1_time = round((time.perf_counter() - request_started) * 1000)
+        print(f"HTTP {compliance_response.status_code} · text/markdown · {req1_time}ms")
+        compliance_response.raise_for_status()
+    except request_error as exc:
+        raise RuntimeError("The live Vercel compliance fetch failed.") from exc
+
+    compliance_markdown = compliance_response.text
+    if not isinstance(compliance_markdown, str) or not compliance_markdown.strip():
+        raise RuntimeError("The live Vercel compliance response contained no Markdown.")
+    current_utc_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    print(f"Fetched at: {current_utc_time}")
+    print()
+
+    print("[LIVE FETCH] Fetching summary.json live...")
+    request_started = time.perf_counter()
+    try:
+        status_response = requests.get(
+            STATUS_SUMMARY_URL,
+            headers=headers,
+            timeout=LIVE_FETCH_TIMEOUT_SECONDS,
+            **redirect_option,
+        )
+        req2_time = round((time.perf_counter() - request_started) * 1000)
+        print(f"HTTP {status_response.status_code} · application/json · {req2_time}ms")
+        status_response.raise_for_status()
+        status_payload = status_response.json()
+    except request_error as exc:
+        raise RuntimeError("The live Vercel status fetch failed.") from exc
+    except ValueError as exc:
+        raise RuntimeError("The live Vercel status response was not valid JSON.") from exc
+
+    if not isinstance(status_payload, dict):
+        raise RuntimeError("The live Vercel status response had an unexpected structure.")
+    page = status_payload.get("page")
+    status = status_payload.get("status")
+    incidents = status_payload.get("incidents")
+    if not isinstance(page, dict) or not isinstance(status, dict) or not isinstance(incidents, list):
+        raise RuntimeError("The live Vercel status response omitted required fields.")
+    json_updated_at = page.get("updated_at")
+    json_status_desc = status.get("description")
+    if not isinstance(json_updated_at, str) or not isinstance(json_status_desc, str):
+        raise RuntimeError("The live Vercel status response contained invalid fields.")
+    incident_count = len(incidents)
+
+    print(f"Publisher status updated: {json_updated_at}")
+    print(f"Overall status: {json_status_desc}")
+    print(f"Active incidents: {incident_count}")
+    print()
+    print("[AGENT] Generating RFP compliance matrix using live evidence...")
+
+    live_context = (
+        f"{compliance_markdown.strip()}\n\n"
+        "## Live Vercel Operational Status\n"
+        f"- Publisher status updated: {json_updated_at}\n"
+        f"- Overall status: {json_status_desc}\n"
+        f"- Active incidents: {incident_count}"
+    )
+    return {
+        "fetched_at": current_utc_time,
+        "compliance": {
+            "url": COMPLIANCE_MARKDOWN_URL,
+            "status_code": compliance_response.status_code,
+            "response_time_ms": req1_time,
+            "markdown": compliance_markdown,
+        },
+        "status": {
+            "url": STATUS_SUMMARY_URL,
+            "status_code": status_response.status_code,
+            "response_time_ms": req2_time,
+            "updated_at": json_updated_at,
+            "description": json_status_desc,
+            "incident_count": incident_count,
+        },
+        "live_context": live_context,
+    }
 
 
 def _required_environment() -> tuple[str, str, str, str]:
@@ -147,6 +255,26 @@ def _make_submit_action(staged_bid: dict[str, Any], _answers: list[dict[str, str
     return submit_action
 
 
+async def process_section_concurrently(
+    title: str,
+    content: str,
+    faiss_index: Any,
+    chunks: list[str],
+    semaphore: asyncio.Semaphore,
+) -> dict[str, str]:
+    """Retrieve evidence and reason over one section within the shared limit."""
+    # Section retrieval and AsyncGroq calls run concurrently in at most five
+    # slots; the HITL approval Event still blocks final submission afterward.
+    async with semaphore:
+        retrieved_context = await asyncio.to_thread(
+            search_index,
+            f"{title}\n{content}",
+            faiss_index,
+            chunks,
+        )
+        return await generate_section_answer(title, content, retrieved_context)
+
+
 async def run_pipeline() -> BidSnapshot:
     """Build the proposal, stage it, register HITL state, and return its session."""
     project_root = Path(__file__).resolve().parent
@@ -161,53 +289,37 @@ async def run_pipeline() -> BidSnapshot:
     for idx, (title, content) in enumerate(RFP_SECTIONS.items()):
         print(f"[{idx}] {title}: {content[:60]}...")
 
-    # 2. LOAD KNOWLEDGE BASE
-    chunks = load_and_chunk_docs(project_root / "sample-data")
+    # 2. INGEST LIVE VENDOR KNOWLEDGE
+    live_evidence = await asyncio.to_thread(fetch_live_evidence)
+    live_context = live_evidence["live_context"]
+    # The blocking fetches run in one worker thread so the event loop stays
+    # responsive; final submission remains blocked by the HITL approval Event.
+    chunks = [live_context]
     faiss_index = build_index(chunks)
 
-    # 3. GENERATE BATCHED AI ANSWERS (WITH SELF-HEALING RATE LIMIT LOGIC)
-    print("DEBUG: AI Reasoning Phase (Groq - Throttled Batches)...")
-    answers = []
-    rate_limit_errors = 0
+    # 3. GENERATE AI ANSWERS WITH BOUNDED CONCURRENCY
     items = list(RFP_SECTIONS.items())
-    total_batches = (len(items) + GROQ_BATCH_SIZE - 1) // GROQ_BATCH_SIZE
-    
-    for i in range(0, len(items), GROQ_BATCH_SIZE):
-        batch_number = i // GROQ_BATCH_SIZE + 1
-        
-        if batch_number > 1:
-            print("   Waiting 6s before the next Groq batch...")
-            await asyncio.sleep(6)
-
-        batch = dict(items[i:i + GROQ_BATCH_SIZE])
-        print(f"-> Processing batch {batch_number} of {total_batches}...")
-        
-        for attempt in range(GROQ_429_MAX_ATTEMPTS):
-            try:
-                batch_answers = await process_all_sections(batch, faiss_index, chunks)
-                answers.extend(batch_answers)
-                print(f"<- Completed batch {batch_number} of {total_batches}.")
-                break
-            except Exception as exc:
-                if "429" in str(exc) and attempt < GROQ_429_MAX_ATTEMPTS - 1:
-                    rate_limit_errors += 1
-                    backoff_seconds = GROQ_429_INITIAL_BACKOFF_SECONDS * (2 ** attempt)
-                    print(
-                        "   [!] Groq rate limit reached. "
-                        f"Backing off for {backoff_seconds}s before attempt "
-                        f"{attempt + 2}/{GROQ_429_MAX_ATTEMPTS}..."
-                    )
-                    await asyncio.sleep(backoff_seconds)
-                else:
-                    raise
+    semaphore = asyncio.Semaphore(GROQ_CONCURRENCY_LIMIT)
+    tasks = [
+        process_section_concurrently(
+            title,
+            content,
+            faiss_index,
+            chunks,
+            semaphore,
+        )
+        for title, content in items
+    ]
+    print("[AGENT] Dispatching all RFP sections concurrently to the Groq reasoning engine...")
+    results = await asyncio.gather(*tasks)
+    answers = list(results)
 
     if not answers:
         print("\n[!] DRY RUN ACTIVE: No API calls made. Exiting before JSON staging.")
         return None
 
     print(f"DEBUG: Completed AI reasoning for {len(answers)} of {len(items)} sections.")
-    print(f"DEBUG: Groq HTTP 429 errors observed: {rate_limit_errors}.")
-    
+
     proposal_answers = [dict(a) for a in answers]
 
     # 4. STAGE AND REGISTER
