@@ -396,12 +396,50 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const [authorizedRepresentative, setAuthorizedRepresentative] = useState(false);
   const [ungroundedAcknowledged, setUngroundedAcknowledged] = useState(false);
   const initializedBidRef = useRef<string | null>(null);
+  const draftRestoredRef = useRef(false);
+  const skipNextDraftSaveRef = useRef(true);
+
+  useEffect(() => {
+    const cachedDraft = window.localStorage.getItem("rfp_draft_state");
+    if (!cachedDraft) {
+      skipNextDraftSaveRef.current = false;
+      return;
+    }
+
+    try {
+      const parsedDraft = JSON.parse(cachedDraft) as unknown;
+      if (
+        !parsedDraft
+        || typeof parsedDraft !== "object"
+        || Array.isArray(parsedDraft)
+        || Object.values(parsedDraft).some((answer) => typeof answer !== "string")
+      ) {
+        throw new Error("Invalid cached RFP draft state.");
+      }
+      draftRestoredRef.current = true;
+      skipNextDraftSaveRef.current = true;
+      setEditedAnswers(parsedDraft as Record<string, string>);
+    } catch {
+      window.localStorage.removeItem("rfp_draft_state");
+      skipNextDraftSaveRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (skipNextDraftSaveRef.current) {
+      skipNextDraftSaveRef.current = false;
+      return;
+    }
+    window.localStorage.setItem("rfp_draft_state", JSON.stringify(editedAnswers));
+  }, [editedAnswers]);
 
   useEffect(() => {
     if (!bid || initializedBidRef.current === bid.id) return;
     initializedBidRef.current = bid.id;
     const released = bid.approved || bid.status === "submitting" || bid.status === "submitted";
-    setEditedAnswers(Object.fromEntries(bid.comparison.map((item) => [item.section, item.answer])));
+    setEditedAnswers((current) => draftRestoredRef.current
+      ? current
+      : Object.fromEntries(bid.comparison.map((item) => [item.section, item.answer])));
     setResolvedItems(Object.fromEntries((bid.human_resolved_sections ?? []).map((section) => [section, true])));
     setApprovalReleased(released);
     setIsSubmitted(bid.submitted || bid.status === "submitted");
@@ -486,6 +524,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
       if (submission.status !== "success" || submission.submitted !== true) {
         throw new Error("The mock procurement API did not confirm submission.");
       }
+      window.localStorage.removeItem("rfp_draft_state");
 
       const overrideSections = bid.comparison
         .filter((item) => isCapabilityMissing(item.answer) || bid.human_override_sections?.includes(item.section))
