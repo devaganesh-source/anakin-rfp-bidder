@@ -29,6 +29,9 @@ from start_backend import ensure_port_available
 
 
 SUBMIT_TIMEOUT_SECONDS = 30
+GROQ_BATCH_SIZE = 1
+GROQ_429_MAX_ATTEMPTS = 3
+GROQ_429_INITIAL_BACKOFF_SECONDS = 15
 
 
 def _required_environment() -> tuple[str, str, str, str]:
@@ -178,28 +181,45 @@ async def run_pipeline() -> BidSnapshot:
     # 3. GENERATE BATCHED AI ANSWERS (WITH SELF-HEALING RATE LIMIT LOGIC)
     print("DEBUG: AI Reasoning Phase (Groq - Throttled Batches)...")
     answers = []
+    rate_limit_errors = 0
     items = list(RFP_SECTIONS.items())
-    batch_size = 2  # Reduced to protect TPM limit
+    total_batches = (len(items) + GROQ_BATCH_SIZE - 1) // GROQ_BATCH_SIZE
     
-    for i in range(0, len(items), batch_size):
-        batch = dict(items[i:i + batch_size])
-        print(f"-> Processing batch {i // batch_size + 1} of {(len(items) + batch_size - 1) // batch_size}...")
+    for i in range(0, len(items), GROQ_BATCH_SIZE):
+        batch_number = i // GROQ_BATCH_SIZE + 1
         
-        max_retries = 3
-        for attempt in range(max_retries):
+        if batch_number > 1:
+            print("   Waiting 6s before the next Groq batch...")
+            await asyncio.sleep(6)
+
+        batch = dict(items[i:i + GROQ_BATCH_SIZE])
+        print(f"-> Processing batch {batch_number} of {total_batches}...")
+        
+        for attempt in range(GROQ_429_MAX_ATTEMPTS):
             try:
                 batch_answers = await process_all_sections(batch, faiss_index, chunks)
                 answers.extend(batch_answers)
+                print(f"<- Completed batch {batch_number} of {total_batches}.")
                 break
             except Exception as exc:
-                if "429" in str(exc) and attempt < max_retries - 1:
-                    print(f"   [!] Groq TPM limit reached. Backing off for 12 seconds (Attempt {attempt + 1}/{max_retries})...")
-                    await asyncio.sleep(12)
+                if "429" in str(exc) and attempt < GROQ_429_MAX_ATTEMPTS - 1:
+                    rate_limit_errors += 1
+                    backoff_seconds = GROQ_429_INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                    print(
+                        "   [!] Groq rate limit reached. "
+                        f"Backing off for {backoff_seconds}s before attempt "
+                        f"{attempt + 2}/{GROQ_429_MAX_ATTEMPTS}..."
+                    )
+                    await asyncio.sleep(backoff_seconds)
                 else:
-                    raise exc
-                    
-        if i + batch_size < len(items):
-            await asyncio.sleep(5)
+                    raise
+
+    if not answers:
+        print("\n[!] DRY RUN ACTIVE: No API calls made. Exiting before headless browser staging.")
+        return None
+
+    print(f"DEBUG: Completed AI reasoning for {len(answers)} of {len(items)} sections.")
+    print(f"DEBUG: Groq HTTP 429 errors observed: {rate_limit_errors}.")
     
     proposal_answers = [dict(a) for a in answers]
 
@@ -207,8 +227,6 @@ async def run_pipeline() -> BidSnapshot:
     print("DEBUG: Performing split handoff for legacy mock portal routing...")
     
     # 1. Prepare the legacy payload for the robot browser
-    # The Mock Portal HTML form still only has 3 input boxes. We must aggregate
-    # the answers so the headless browser knows where to type them.
     mapped_answers_dict = {
         "Security": [],
         "Tech Specs": [],
@@ -235,11 +253,10 @@ async def run_pipeline() -> BidSnapshot:
     ]
 
     # 4. STAGE AND REGISTER
-    # We pass the aggregated 3-field payload to the robot browser so it doesn't crash on invalid form fields
     staged = await stage_bid(portal_url, legacy_browser_payload, anakin_api_key)
     submit_action = _make_submit_action(staged, legacy_browser_payload)
     
-    # But we pass the raw, full 16-item payload to the Next.js UI!
+    # Pass the full dynamic requirement payload to the Next.js review UI.
     return await manager.register_staged_bid(
         staged,
         RFP_SECTIONS,        # Dynamic, unadulterated requirements
@@ -260,6 +277,11 @@ async def main(serve: bool = True) -> None:
         ensure_port_available(hitl_host, hitl_port)
 
     snapshot = await run_pipeline()
+    
+    # Handle graceful exit if running in dry-run mode
+    if not snapshot:
+        return
+
     dashboard_url = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:3000").rstrip("/")
     review_url = f"{dashboard_url}/?bid={snapshot.id}"
     print(f"Dashboard review URL: {review_url}")
