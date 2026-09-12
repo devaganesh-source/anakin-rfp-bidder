@@ -871,30 +871,55 @@ async def process_all_sections(
             }
         )
 
-    # One request avoids TPM contention between large evidence payloads. Strict
-    # decoding guarantees the batch shape; local validation still checks facts.
-    raw_json = await _request_json_completion(
-        {"requirements": requirements, "evidence_pool": evidence_pool},
-        FORMATTING_INSTRUCTIONS[0],
-        f"{len(sections)}-section bid batch",
-        batch=True,
-        max_completion_tokens=3072,
-        reasoning_effort="low",
-    )
-    try:
-        batch_output = RFPBatchOutput.model_validate_json(raw_json)
-    except (ValidationError, json.JSONDecodeError) as exc:
-        print(f"[RELIABILITY] Batch output failed structured validation: {exc}")
-        return [
-            _deterministic_failure(
-                title,
-                "The batch response failed structured-output validation; human review is required.",
-            )
-            for title, _ in sections
+    # Two sequential batches keep each request below Groq's 8k TPM request
+    # ceiling. Only evidence referenced by that batch crosses the API boundary;
+    # the existing bounded retry loop handles any rolling-minute contention.
+    batch_size = 6
+    batch_count = (len(requirements) + batch_size - 1) // batch_size
+    batch_outputs: list[RFPBatchSectionOutput] = []
+    for offset in range(0, len(requirements), batch_size):
+        batch_requirements = requirements[offset : offset + batch_size]
+        batch_evidence_ids = {
+            evidence_id
+            for requirement in batch_requirements
+            for evidence_id in requirement["evidence_ids"]
+        }
+        batch_evidence_pool = [
+            evidence
+            for evidence in evidence_pool
+            if evidence["id"] in batch_evidence_ids
         ]
+        batch_number = offset // batch_size + 1
+        print(
+            f"[TOKEN BUDGET] Generating Groq batch {batch_number}/{batch_count} "
+            f"({len(batch_requirements)} requirements)."
+        )
+        raw_json = await _request_json_completion(
+            {
+                "requirements": batch_requirements,
+                "evidence_pool": batch_evidence_pool,
+            },
+            FORMATTING_INSTRUCTIONS[0],
+            f"bid batch {batch_number}/{batch_count}",
+            batch=True,
+            max_completion_tokens=2048,
+            reasoning_effort="low",
+        )
+        try:
+            batch_output = RFPBatchOutput.model_validate_json(raw_json)
+        except (ValidationError, json.JSONDecodeError) as exc:
+            print(f"[RELIABILITY] Batch output failed structured validation: {exc}")
+            return [
+                _deterministic_failure(
+                    title,
+                    "The batch response failed structured-output validation; human review is required.",
+                )
+                for title, _ in sections
+            ]
+        batch_outputs.extend(batch_output.answers)
 
     outputs_by_section: dict[str, list[RFPBatchSectionOutput]] = {}
-    for output in batch_output.answers:
+    for output in batch_outputs:
         outputs_by_section.setdefault(output.section, []).append(output)
 
     answers: list[SectionAnswer] = []
