@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import datetime
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,8 @@ except ModuleNotFoundError:  # Keep the script runnable in the minimal project v
 
 from actuation.hitl_manager import BidSnapshot, app as hitl_app, manager
 from crawler import RFPCrawler
-from reasoner.groq_reasoner import generate_section_answer
-from reasoner.vector_store import build_index, search_index
+from reasoner.groq_reasoner import process_all_sections
+from reasoner.vector_store import build_index
 from start_backend import ensure_port_available
 
 
@@ -35,6 +36,35 @@ COMPLIANCE_MARKDOWN_URL = "https://vercel.com/docs/security/compliance.md"
 STATUS_SUMMARY_URL = "https://www.vercel-status.com/api/v2/summary.json"
 LIVE_FETCH_TIMEOUT_SECONDS = 30
 SUBMIT_TIMEOUT_SECONDS = 30
+
+
+def _chunk_live_markdown(markdown: str) -> list[str]:
+    """Split public Markdown into source-labelled sections for focused retrieval."""
+    cleaned = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", markdown, count=1, flags=re.DOTALL)
+    cleaned = re.sub(
+        r"<!-- docsgraph:related -->.*?<!-- /docsgraph:related -->",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    headings = list(re.finditer(r"^(#{1,4})\s+(.+?)\s*$", cleaned, flags=re.MULTILINE))
+    chunks: list[str] = []
+    for position, heading in enumerate(headings):
+        body_start = heading.end()
+        body_end = headings[position + 1].start() if position + 1 < len(headings) else len(cleaned)
+        body = cleaned[body_start:body_end].strip()
+        if not body:
+            continue
+        title = heading.group(2).strip()
+        chunks.append(
+            f"Source URL: {COMPLIANCE_MARKDOWN_URL}\n"
+            f"Section: {title}\n\n"
+            f"{body}"
+        )
+
+    if not chunks:
+        raise RuntimeError("The live Vercel compliance Markdown had no usable sections.")
+    return chunks
 
 
 def fetch_live_evidence() -> dict:
@@ -110,13 +140,15 @@ def fetch_live_evidence() -> dict:
     print()
     print("[AGENT] Generating RFP compliance matrix using live evidence...")
 
-    live_context = (
-        f"{compliance_markdown.strip()}\n\n"
-        "## Live Vercel Operational Status\n"
+    live_chunks = _chunk_live_markdown(compliance_markdown)
+    live_chunks.append(
+        f"Source URL: {STATUS_SUMMARY_URL}\n"
+        "Section: Live Vercel Operational Status\n\n"
         f"- Publisher status updated: {json_updated_at}\n"
         f"- Overall status: {json_status_desc}\n"
         f"- Active incidents: {incident_count}"
     )
+    print(f"[RAG] Indexed {len(live_chunks)} focused live-evidence chunks.")
     return {
         "fetched_at": current_utc_time,
         "compliance": {
@@ -133,7 +165,7 @@ def fetch_live_evidence() -> dict:
             "description": json_status_desc,
             "incident_count": incident_count,
         },
-        "live_context": live_context,
+        "live_chunks": live_chunks,
     }
 
 
@@ -254,27 +286,6 @@ def _make_submit_action(staged_bid: dict[str, Any], _answers: list[dict[str, str
     return submit_action
 
 
-async def process_section_concurrently(
-    title: str,
-    content: str,
-    faiss_index: Any,
-    chunks: list[str],
-    semaphore: asyncio.Semaphore,
-) -> dict[str, str]:
-    """Retrieve evidence and reason over one section within the shared limit."""
-    retrieved_context = await asyncio.to_thread(
-        search_index,
-        f"{title}\n{content}",
-        faiss_index,
-        chunks,
-    )
-
-    # Limit only the external Groq requests; local evidence retrieval can still
-    # run concurrently while final submission remains blocked by HITL approval.
-    async with semaphore:
-        return await generate_section_answer(title, content, retrieved_context)
-
-
 async def run_pipeline() -> BidSnapshot:
     """Build the proposal, stage it, register HITL state, and return its session."""
     project_root = Path(__file__).resolve().parent
@@ -291,28 +302,15 @@ async def run_pipeline() -> BidSnapshot:
 
     # 2. INGEST LIVE VENDOR KNOWLEDGE
     live_evidence = await asyncio.to_thread(fetch_live_evidence)
-    live_context = live_evidence["live_context"]
     # The blocking fetches run in one worker thread so the event loop stays
     # responsive; final submission remains blocked by the HITL approval Event.
-    chunks = [live_context]
+    chunks = live_evidence["live_chunks"]
     faiss_index = build_index(chunks)
 
-    # 3. GENERATE AI ANSWERS WITH BOUNDED CONCURRENCY
+    # 3. GENERATE AI ANSWERS IN ONE TOKEN-EFFICIENT BATCH
     items = list(RFP_SECTIONS.items())
-    semaphore = asyncio.Semaphore(1)
-    tasks = [
-        process_section_concurrently(
-            title,
-            content,
-            faiss_index,
-            chunks,
-            semaphore,
-        )
-        for title, content in items
-    ]
-    print("[AGENT] Dispatching all RFP sections concurrently to the Groq reasoning engine...")
-    results = await asyncio.gather(*tasks)
-    answers = list(results)
+    print("[AGENT] Sending one grounded RFP batch to the Groq reasoning engine...")
+    answers = await process_all_sections(RFP_SECTIONS, faiss_index, chunks)
 
     if not answers:
         print("\n[!] DRY RUN ACTIVE: No API calls made. Exiting before JSON staging.")
