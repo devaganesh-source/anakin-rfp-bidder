@@ -34,13 +34,15 @@ type BidSnapshot = {
   submitted: boolean;
   manual_intervention_required: boolean;
   error: string | null;
-  human_override_sections?: string[];
-  human_resolved_sections?: string[];
+  rfp_title: string;
+  rfp_source_url: string;
+  evidence_sources: string[];
+  evidence_fetched_at: string;
+  human_override_sections: string[];
+  human_resolved_sections: string[];
 };
 
-type GenerationStage = "crawling" | "drafting" | "staging";
-type EnvelopeId = "technical" | "knowledge" | "security" | "commercial";
-type MockPortalAction = "approve" | "submit";
+type EnvelopeId = "assurance" | "protection" | "resilience" | "operations";
 
 type ProcurementEnvelope = {
   id: EnvelopeId;
@@ -53,14 +55,16 @@ const AGENCY_NAME = "Global Enterprise Solutions Directorate";
 const SOLICITATION_REFERENCE = "#2026-ENT-092";
 const POLL_INTERVAL_MS = 5000;
 const REQUEST_TIMEOUT_MS = 12000;
+const DEFAULT_RFP_URL = process.env.NEXT_PUBLIC_DEFAULT_RFP_URL
+  || "https://devaganesh-source.github.io/my-static-site/";
 const API_BASE_URL = (
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8001"
 ).replace(/\/$/, "");
 
-const GENERATION_STAGES: { key: GenerationStage; label: string }[] = [
-  { key: "crawling", label: "RFP intake" },
-  { key: "drafting", label: "Response drafting" },
-  { key: "staging", label: "Portal staging" },
+const GENERATION_STAGES = [
+  "Anakin reads the selected live RFP",
+  "Current vendor evidence is retrieved and validated",
+  "Anakin stages the draft on the controlled mock portal",
 ];
 
 const PROCESS_STEPS = [
@@ -73,52 +77,33 @@ const PROCESS_STEPS = [
 
 const PROCUREMENT_ENVELOPES: ProcurementEnvelope[] = [
   {
-    id: "technical",
+    id: "assurance",
     number: "1.0",
-    title: "Technical Environment & APIs",
-    description: "Integration architecture, service interfaces, and platform operation.",
+    title: "Independent Assurance & Regulatory Compliance",
+    description: "External attestations, certifications, privacy, and regulated workloads.",
   },
   {
-    id: "knowledge",
+    id: "protection",
     number: "2.0",
-    title: "Knowledge Ingestion & Traceability",
-    description: "Content ingestion, evidence provenance, and response traceability.",
+    title: "Data Protection & Infrastructure Security",
+    description: "Encryption, infrastructure, identity, and production controls.",
   },
   {
-    id: "security",
+    id: "resilience",
     number: "3.0",
-    title: "Security & Compliance",
-    description: "Identity, data protection, auditability, and governance controls.",
+    title: "Resilience, Recovery & Security Assurance",
+    description: "Regional continuity, recovery controls, and continuous testing.",
   },
   {
-    id: "commercial",
+    id: "operations",
     number: "4.0",
-    title: "Commercials & Support",
-    description: "Pricing, implementation terms, service support, and maintenance.",
+    title: "Current Operational Evidence",
+    description: "Live service health, incidents, and publisher timestamps.",
   },
 ];
 
 function apiUrl(path: string) {
   return `${API_BASE_URL}${path}`;
-}
-
-function mockPortalApiUrl(bid: BidSnapshot, action: MockPortalAction) {
-  const reviewUrl = new URL(bid.review_url);
-  const loopbackHosts = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
-  const expectedPath = `/bids/${encodeURIComponent(bid.portal_bid_id)}/submit`;
-  if (
-    !["http:", "https:"].includes(reviewUrl.protocol)
-    || !loopbackHosts.has(reviewUrl.hostname)
-    || reviewUrl.pathname !== expectedPath
-    || Boolean(reviewUrl.search)
-    || Boolean(reviewUrl.hash)
-  ) {
-    throw new Error("Bids can only be submitted to the configured local mock API.");
-  }
-  return new URL(
-    `/api/bids/${encodeURIComponent(bid.portal_bid_id)}/${action}`,
-    reviewUrl.origin,
-  ).toString();
 }
 
 function finalizedAnswers(comparison: ReviewSection[]) {
@@ -228,28 +213,27 @@ function isCapabilityMissing(answer: string) {
 
 function envelopeFor(item: ReviewSection): EnvelopeId {
   const text = `${item.section} ${item.requirement}`.toLowerCase();
-  if (/pricing|commercial|fee|subscription|tax|support|maintenance|service level/.test(text)) return "commercial";
-  if (/security|compliance|saml|oidc|encryption|audit|access control|governance|data location|backup/.test(text)) return "security";
-  if (/knowledge|ingestion|document|source|traceability|citation|evidence|response quality/.test(text)) return "knowledge";
-  return "technical";
+  if (/^\s*1\./.test(item.section) || /soc|iso|gdpr|pci|hipaa|privacy framework/.test(text)) return "assurance";
+  if (/^\s*2\./.test(item.section) || /encryption|infrastructure|production access/.test(text)) return "protection";
+  if (/^\s*3\./.test(item.section) || /resilien|backup|recovery|security testing/.test(text)) return "resilience";
+  return "operations";
 }
 
-function GenerationProgress({ stage }: { stage: GenerationStage }) {
-  const activeIndex = GENERATION_STAGES.findIndex((item) => item.key === stage);
+function GenerationProgress() {
   return (
     <section className="glass-panel mb-7 rounded-2xl p-5 sm:p-6" aria-live="polite" aria-label="Bid generation progress">
       <div className="mb-4 flex items-center justify-between gap-4">
         <div>
           <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-indigo-300">Orchestrator in flight</p>
-          <p className="mt-1 text-sm text-zinc-300">Preparing a new grounded review session</p>
+          <p className="mt-1 text-sm text-zinc-300">Running the live workflow. Verified source timestamps appear in the completed binder.</p>
         </div>
         <span className="h-2 w-2 animate-pulse rounded-full bg-indigo-300 shadow-[0_0_14px_rgba(165,180,252,.9)]" />
       </div>
       <ol className="grid gap-2 sm:grid-cols-3">
         {GENERATION_STAGES.map((item, index) => (
-          <li key={item.key} className={`flex items-center gap-3 rounded-xl border px-3 py-3 text-xs ${index === activeIndex ? "border-indigo-300/35 bg-indigo-300/10 text-indigo-100" : index < activeIndex ? "border-emerald-300/20 bg-emerald-300/[0.06] text-emerald-200" : "border-zinc-800 bg-zinc-950/30 text-zinc-500"}`}>
-            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full border border-current font-mono text-[10px]">{index < activeIndex ? "✓" : `0${index + 1}`}</span>
-            {item.label}
+          <li key={item} className="flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-950/30 px-3 py-3 text-xs text-zinc-300">
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full border border-indigo-300/50 font-mono text-[10px] text-indigo-200">{`0${index + 1}`}</span>
+            {item}
           </li>
         ))}
       </ol>
@@ -385,6 +369,7 @@ function RequirementField({ item, fieldIndex, reference, editedAnswer, editable,
 }
 
 function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: () => void; onSnapshot: (snapshot: BidSnapshot) => void }) {
+  const draftStorageKey = `anakin-rfp-draft:${bidId}`;
   const [bid, setBid] = useState<BidSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -395,12 +380,14 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const [resolvedItems, setResolvedItems] = useState<Record<string, boolean>>({});
   const [authorizedRepresentative, setAuthorizedRepresentative] = useState(false);
   const [ungroundedAcknowledged, setUngroundedAcknowledged] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const initializedBidRef = useRef<string | null>(null);
   const draftRestoredRef = useRef(false);
   const skipNextDraftSaveRef = useRef(true);
 
   useEffect(() => {
-    const cachedDraft = window.localStorage.getItem("rfp_draft_state");
+    const cachedDraft = window.localStorage.getItem(draftStorageKey);
     if (!cachedDraft) {
       skipNextDraftSaveRef.current = false;
       return;
@@ -420,18 +407,18 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
       skipNextDraftSaveRef.current = true;
       setEditedAnswers(parsedDraft as Record<string, string>);
     } catch {
-      window.localStorage.removeItem("rfp_draft_state");
+      window.localStorage.removeItem(draftStorageKey);
       skipNextDraftSaveRef.current = false;
     }
-  }, []);
+  }, [draftStorageKey]);
 
   useEffect(() => {
     if (skipNextDraftSaveRef.current) {
       skipNextDraftSaveRef.current = false;
       return;
     }
-    window.localStorage.setItem("rfp_draft_state", JSON.stringify(editedAnswers));
-  }, [editedAnswers]);
+    window.localStorage.setItem(draftStorageKey, JSON.stringify(editedAnswers));
+  }, [draftStorageKey, editedAnswers]);
 
   useEffect(() => {
     if (!bid || initializedBidRef.current === bid.id) return;
@@ -462,11 +449,12 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
       if (!response.ok) throw new Error(`Unable to load bid (${response.status}).`);
       const snapshot = restoreSavedBidSnapshot((await response.json()) as BidSnapshot);
       setBid(snapshot);
+      setLoadError(null);
       onSnapshot(snapshot);
       if (snapshot.approved || snapshot.status === "submitting" || snapshot.status === "submitted") setApprovalReleased(true);
       if (snapshot.submitted || snapshot.status === "submitted") setIsSubmitted(true);
-    } catch {
-      // A missing or unavailable bid leaves the review route empty by design.
+    } catch (error) {
+      setLoadError(requestErrorMessage(error, "Bid retrieval"));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -483,6 +471,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const approveAndSubmit = async () => {
     if (!bidId || !bid || bid.status !== "awaiting_approval" || !authorizedRepresentative || !ungroundedAcknowledged) return;
     setApproving(true);
+    setActionError(null);
     try {
       const bidWithOverrides: BidSnapshot = {
         ...bid,
@@ -491,76 +480,39 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
           answer: editedAnswers[item.section] ?? item.answer,
         })),
       };
-      const responseOverrides = bidWithOverrides.comparison
-        .filter((item, index) => item.answer !== bid.comparison[index]?.answer)
-        .map(({ section, answer }) => ({ section, answer }));
       const answers = finalizedAnswers(bidWithOverrides.comparison);
-      const portalApprovalResponse = await fetch(mockPortalApiUrl(bid, "approve"), {
+      const approvalResponse = await fetch(apiUrl(`/api/bids/${encodeURIComponent(bidId)}/approve`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           answers,
           authorized_representative: true,
           ungrounded_items_acknowledged: true,
+          human_resolved_sections: Object.entries(resolvedItems)
+            .filter(([, resolved]) => resolved)
+            .map(([section]) => section),
         }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!portalApprovalResponse.ok) {
-        const detail = await portalApprovalResponse.text();
-        throw new Error(detail || `Approval failed (${portalApprovalResponse.status}).`);
+      if (!approvalResponse.ok) {
+        let detail = `Authorization failed (${approvalResponse.status}).`;
+        try {
+          const payload = (await approvalResponse.json()) as { detail?: { message?: string } | string };
+          if (typeof payload.detail === "string") detail = payload.detail;
+          else if (payload.detail?.message) detail = payload.detail.message;
+        } catch {
+          // Keep the stable status-based error when the backend returns non-JSON.
+        }
+        throw new Error(detail);
       }
-
-      const submissionResponse = await fetch(mockPortalApiUrl(bid, "submit"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ answers }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!submissionResponse.ok) {
-        const detail = await submissionResponse.text();
-        throw new Error(detail || `Submission failed (${submissionResponse.status}).`);
-      }
-      const submission = (await submissionResponse.json()) as { status?: string; submitted?: boolean };
-      if (submission.status !== "success" || submission.submitted !== true) {
-        throw new Error("The mock procurement API did not confirm submission.");
-      }
-      window.localStorage.removeItem("rfp_draft_state");
-
-      const overrideSections = bid.comparison
-        .filter((item) => isCapabilityMissing(item.answer) || bid.human_override_sections?.includes(item.section))
-        .map((item) => item.section);
-      const submittedSnapshot: BidSnapshot = {
-        ...bidWithOverrides,
-        status: "submitted",
-        approved: true,
-        submitted: true,
-        human_override_sections: overrideSections,
-        human_resolved_sections: overrideSections.filter((section) => resolvedItems[section]),
-      };
-      setIsSubmitted(true);
+      const authorizedSnapshot = (await approvalResponse.json()) as BidSnapshot;
+      window.localStorage.removeItem(draftStorageKey);
       setApprovalReleased(true);
-      setBid(submittedSnapshot);
-      onSnapshot(submittedSnapshot);
-
-      // Synchronize the pipeline's HITL record after the frontend-owned JSON
-      // submission. Its gated callback now observes the already-submitted API state.
-      await fetch(apiUrl(`/api/bids/${encodeURIComponent(bidId)}/approve`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bid: bidWithOverrides,
-          solicitation_reference: SOLICITATION_REFERENCE,
-          session_id: bid.id,
-          attestations: {
-            authorized_representative: true,
-            ungrounded_items_acknowledged: true,
-          },
-          response_overrides: responseOverrides,
-        }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch {
-      // The backend remains authoritative; polling will reflect any completed action.
+      setIsSubmitted(authorizedSnapshot.submitted || authorizedSnapshot.status === "submitted");
+      setBid(authorizedSnapshot);
+      onSnapshot(authorizedSnapshot);
+    } catch (error) {
+      setActionError(requestErrorMessage(error, "Authorization"));
     } finally {
       setApproving(false);
     }
@@ -582,7 +534,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
   const attestationsComplete = authorizedRepresentative && ungroundedAcknowledged;
 
   if (loading && !bid) return <EmptyState title="Loading response record" body="Retrieving the staged submission from the local procurement workflow." action={<button type="button" onClick={onBack} className="border border-[#173f68] px-4 py-2.5 text-sm font-bold text-[#173f68]">Back to dashboard</button>} />;
-  if (!bid) return null;
+  if (!bid) return <EmptyState warning title="Response record unavailable" body={loadError || "The staged bid could not be loaded."} onRetry={() => void loadBid()} action={<button type="button" onClick={onBack} className="border border-[#173f68] px-4 py-2.5 text-sm font-bold text-[#173f68]">Back to dashboard</button>} />;
 
   if (isSubmitted) {
     return (
@@ -645,7 +597,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
             <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <p className="text-xs font-extrabold uppercase tracking-[0.12em] text-[#6f520d]">Ready-Made RFP Submission Package</p>
-                <h2 id="form-title" className="mt-2 font-serif text-3xl font-bold text-[#173f68]">Enterprise Knowledge Management & Response Automation Platform</h2>
+                <h2 id="form-title" className="mt-2 font-serif text-3xl font-bold text-[#173f68]">{bid.rfp_title}</h2>
                 <p className="mt-2 text-base text-slate-600">Compiled final-response binder for authorized review, certification, and electronic transmission.</p>
               </div>
               <div className={`shrink-0 border px-4 py-3 ${statusStyles(bid.status)}`}>
@@ -660,7 +612,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
               {[
                 ["Solicitation reference", SOLICITATION_REFERENCE],
                 ["Response record", bid.portal_bid_id],
-                ["Session ID hash", sessionHash],
+                ["Evidence captured", new Date(bid.evidence_fetched_at).toLocaleString()],
                 ["Record synchronization", refreshing ? "Checking for updates…" : `Active · ${POLL_INTERVAL_MS / 1000}s polling`],
               ].map(([label, value]) => (
                 <div key={label} className="border-b border-slate-300 p-3.5 last:border-b-0 sm:border-r sm:[&:nth-child(2)]:border-r-0 lg:border-b-0 lg:[&:nth-child(2)]:border-r lg:last:border-r-0">
@@ -669,6 +621,16 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
                 </div>
               ))}
               </dl>
+            </div>
+
+            <div className="mt-4 border border-[#7a9c87] bg-[#eef7f1] px-4 py-3 text-sm text-[#234f35]">
+              <p className="font-extrabold uppercase tracking-[0.08em]">Live web provenance</p>
+              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
+                <a href={bid.rfp_source_url} target="_blank" rel="noreferrer" className="font-semibold underline underline-offset-2">Source RFP <span aria-hidden="true">↗</span></a>
+                {bid.evidence_sources.map((source, index) => (
+                  <a key={source} href={source} target="_blank" rel="noreferrer" className="font-semibold underline underline-offset-2">Live evidence {index + 1} <span aria-hidden="true">↗</span></a>
+                ))}
+              </div>
             </div>
           </section>
 
@@ -735,7 +697,7 @@ function StagedReview({ bidId, onBack, onSnapshot }: { bidId: string; onBack: ()
               <div className="mb-5 border border-[#d2b45b] bg-[#fff9e5] px-4 py-3 text-sm leading-6 text-[#5f4913]">Submission constitutes an electronic certification for this response record. Both statements are required before the final procurement action can be released.</div>
 
               {hasEdits && <div className="mb-4 flex items-start gap-2 border border-[#9b7419] bg-[#fff8df] px-4 py-3 text-sm text-[#6f520d]" role="status"><Icon name="warning" size={17} /><span>Manual changes are highlighted in amber. Review each override before signing this package.</span></div>}
-              {bid.error && <p className="mb-4 text-sm font-semibold text-red-800">{bid.error}</p>}
+              {(bid.error || actionError) && <p className="mb-4 text-sm font-semibold text-red-800">{bid.error || actionError}</p>}
 
               <fieldset className="space-y-3" disabled={!canEdit}>
                 <legend className="sr-only">Required legal certifications</legend>
@@ -849,8 +811,8 @@ function DashboardContent() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [generationStage, setGenerationStage] = useState<GenerationStage>("crawling");
   const [error, setError] = useState<string | null>(null);
+  const [rfpUrl, setRfpUrl] = useState(DEFAULT_RFP_URL);
   const generationRequestInFlightRef = useRef(false);
 
   const rememberBid = useCallback((snapshot: BidSnapshot) => {
@@ -891,6 +853,11 @@ function DashboardContent() {
         return restoreSavedBidSnapshot((await response.json()) as BidSnapshot);
       }));
       const snapshots = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      const validIds = knownBidIds.filter((_, index) => results[index]?.status === "fulfilled");
+      if (validIds.length !== knownBidIds.length) {
+        setKnownBidIds(validIds);
+        window.localStorage.setItem(KNOWN_BIDS_STORAGE_KEY, JSON.stringify(validIds));
+      }
       setBids(snapshots);
       setError(null);
     } catch {
@@ -909,29 +876,22 @@ function DashboardContent() {
     return () => window.clearInterval(interval);
   }, [loadTrackedBids, registryReady, reviewBidId]);
 
-  useEffect(() => {
-    if (!generating) return;
-    setGenerationStage("crawling");
-    const draftingTimer = window.setTimeout(() => setGenerationStage("drafting"), 900);
-    const stagingTimer = window.setTimeout(() => setGenerationStage("staging"), 2100);
-    return () => {
-      window.clearTimeout(draftingTimer);
-      window.clearTimeout(stagingTimer);
-    };
-  }, [generating]);
-
   const generateBid = async () => {
     if (generationRequestInFlightRef.current) return;
     generationRequestInFlightRef.current = true;
     setGenerating(true);
     setError(null);
     try {
+      const parsedUrl = new URL(rfpUrl);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error("RFP source must be an HTTP or HTTPS URL.");
+      }
       // Deliberately no client timeout: disconnecting does not cancel server work,
       // and a retry could otherwise start a duplicate full pipeline run.
       const response = await fetch(apiUrl("/api/bids/generate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ source_url: parsedUrl.toString() }),
       });
       if (!response.ok) {
         let message = `Bid generation failed (${response.status}).`;
@@ -985,8 +945,19 @@ function DashboardContent() {
             <h1 className="max-w-3xl text-4xl font-semibold tracking-[-0.055em] text-zinc-50 sm:text-5xl lg:text-6xl">Bids in motion.<br /><span className="text-gradient">Humans in control.</span></h1>
             <p className="mt-5 max-w-2xl text-sm leading-7 text-zinc-400 sm:text-base">Track staged responses, inspect grounding exceptions, and open the formal submission binder when a bid is ready for review.</p>
           </div>
-          <div className="flex flex-col items-start gap-3 lg:items-end">
-            <GenerateNewBidButton disabled={generating} onClick={() => void generateBid()} />
+          <div className="flex w-full max-w-xl flex-col items-stretch gap-3 lg:items-end">
+            <label className="w-full text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">
+              Live RFP URL
+              <input
+                type="url"
+                value={rfpUrl}
+                onChange={(event) => setRfpUrl(event.target.value)}
+                disabled={generating}
+                placeholder="https://example.com/rfp"
+                className="mt-2 min-h-11 w-full rounded-xl border border-zinc-700 bg-zinc-950/70 px-3 py-2 font-mono text-xs normal-case tracking-normal text-zinc-200 outline-none focus:border-indigo-300 disabled:opacity-60"
+              />
+            </label>
+            <GenerateNewBidButton disabled={generating || !rfpUrl.trim()} onClick={() => void generateBid()} />
             <p className="flex items-center gap-2 text-xs text-zinc-600"><span className={`h-1.5 w-1.5 rounded-full ${refreshing ? "animate-ping bg-indigo-300" : "bg-emerald-300"}`} /> {refreshing ? "Refreshing bid states" : `Live sync every ${POLL_INTERVAL_MS / 1000}s`}</p>
           </div>
         </header>
@@ -998,7 +969,7 @@ function DashboardContent() {
           </div>
         )}
 
-        {generating && <GenerationProgress stage={generationStage} />}
+        {generating && <GenerationProgress />}
 
         <section className="mb-9 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Bid metrics">
           {[
@@ -1043,8 +1014,8 @@ function DashboardContent() {
                         <span className="font-mono text-[10px] text-zinc-600">{String(index + 1).padStart(2, "0")}</span>
                         <DashboardStatusBadge status={bid.status} />
                       </div>
-                      <h3 className="mt-3 truncate font-mono text-base font-semibold text-zinc-100">{bid.portal_bid_id}</h3>
-                      <p className="mt-1 truncate text-xs text-zinc-600">Session {bid.id}</p>
+                      <h3 className="mt-3 truncate text-base font-semibold text-zinc-100">{bid.rfp_title}</h3>
+                      <p className="mt-1 truncate font-mono text-xs text-zinc-600">Record {bid.portal_bid_id} · Session {bid.id}</p>
                     </div>
                     <dl className="grid grid-cols-2 gap-4 text-sm">
                       <div>

@@ -3,7 +3,7 @@
 After ``stage_bid`` succeeds, call ``await manager.register_staged_bid(...)``
 with its receipt, the requirements, reasoner answers, and an async submit_action.
 Poll GET /api/bids/{id}; only a human's POST /api/bids/{id}/approve releases
-the waiting action. Review data is immutable: changed answers need a new draft.
+the waiting action. That approval atomically records the reviewed answer revision.
 
 submit_action must return True only after confirming final submission on the
 MOCK_PORTAL_URL draft. It must verify the reviewed answers and honor the portal's
@@ -31,7 +31,7 @@ from uuid import uuid4
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from actuation.anakin_client import _mock_origin
 
@@ -40,7 +40,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 BidStatus = Literal["awaiting_approval", "submitting", "submitted", "manual_intervention"]
-SubmitAction = Callable[[], Awaitable[bool]]
+SubmitAction = Callable[[Mapping[str, str]], Awaitable[bool]]
 
 
 def _http_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -74,6 +74,29 @@ class BidSnapshot(BaseModel):
     submitted: bool
     manual_intervention_required: bool
     error: str | None
+    rfp_title: str
+    rfp_source_url: str
+    evidence_sources: tuple[str, ...]
+    evidence_fetched_at: str
+    human_override_sections: tuple[str, ...]
+    human_resolved_sections: tuple[str, ...]
+
+
+class BidApprovalRequest(BaseModel):
+    """The reviewed answer revision and human attestations that unlock submission."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    answers: dict[str, str]
+    authorized_representative: bool
+    ungrounded_items_acknowledged: bool
+    human_resolved_sections: list[str] = Field(default_factory=list)
+
+
+class BidGenerationRequest(BaseModel):
+    """An optional live RFP URL selected by the dashboard operator."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_url: str | None = Field(default=None, max_length=2048)
 
 
 @dataclass
@@ -87,6 +110,12 @@ class _StagedBid:
     status: BidStatus = "awaiting_approval"
     error: str | None = None
     task: asyncio.Task[None] | None = None
+    rfp_title: str = "Untitled RFP"
+    rfp_source_url: str = ""
+    evidence_sources: tuple[str, ...] = ()
+    evidence_fetched_at: str = ""
+    human_override_sections: tuple[str, ...] = ()
+    human_resolved_sections: tuple[str, ...] = ()
 
 
 def _review_rows(
@@ -147,6 +176,11 @@ class HITLManager:
     async def register_staged_bid(
         self, staged_bid: Mapping[str, Any], requirements: Mapping[str, str],
         answers: Sequence[Mapping[str, str]], submit_action: SubmitAction,
+        *,
+        rfp_title: str = "Untitled RFP",
+        rfp_source_url: str = "",
+        evidence_sources: Sequence[str] = (),
+        evidence_fetched_at: str = "",
     ) -> BidSnapshot:
         """Register only after staging reaches review; return the dashboard ID.
 
@@ -176,9 +210,19 @@ class HITLManager:
             or inspect.iscoroutinefunction(getattr(submit_action, "__call__", None))
         ):
             raise ValueError("submit_action must be an async callable, not a running action.")
+        metadata = (rfp_title, rfp_source_url, evidence_fetched_at)
+        if any(not isinstance(value, str) or not value.strip() for value in metadata):
+            raise ValueError("RFP title, source URL, and evidence timestamp are required.")
+        source_urls = tuple(evidence_sources)
+        if not source_urls or any(
+            not isinstance(value, str) or not value.strip() for value in source_urls
+        ):
+            raise ValueError("At least one evidence source URL is required.")
         bid = _StagedBid(
             id=uuid4().hex, portal_bid_id=portal_id, review_url=review_url,
             comparison=_review_rows(requirements, answers), submit_action=submit_action,
+            rfp_title=rfp_title.strip(), rfp_source_url=rfp_source_url.strip(),
+            evidence_sources=source_urls, evidence_fetched_at=evidence_fetched_at.strip(),
         )
         bid.task = asyncio.create_task(self._wait_and_submit(bid), name=f"hitl-{bid.id}")
         self._bids[bid.id] = bid
@@ -198,6 +242,10 @@ class HITLManager:
             status=bid.status, comparison=bid.comparison, approved=bid.approval.is_set(),
             submitted=bid.status == "submitted",
             manual_intervention_required=bid.status == "manual_intervention", error=bid.error,
+            rfp_title=bid.rfp_title, rfp_source_url=bid.rfp_source_url,
+            evidence_sources=bid.evidence_sources, evidence_fetched_at=bid.evidence_fetched_at,
+            human_override_sections=bid.human_override_sections,
+            human_resolved_sections=bid.human_resolved_sections,
         )
 
     async def _poll(self, bid_id: str, response: Response) -> BidSnapshot:
@@ -205,7 +253,9 @@ class HITLManager:
         response.headers["Cache-Control"] = "no-store"
         return self._snapshot(self._get_bid(bid_id))
 
-    async def _approve(self, bid_id: str, response: Response) -> BidSnapshot:
+    async def _approve(
+        self, bid_id: str, payload: BidApprovalRequest, response: Response
+    ) -> BidSnapshot:
         """Accept an explicit human approval and schedule the one final action."""
         # No await between checking state and setting the Event: one POST wins.
         bid = self._get_bid(bid_id)
@@ -225,10 +275,43 @@ class HITLManager:
                 "This bid has already been approved; duplicate approval is not accepted.",
             )
         if bid.status == "awaiting_approval":
+            if not payload.authorized_representative or not payload.ungrounded_items_acknowledged:
+                raise _http_error(
+                    422,
+                    "HUMAN_ATTESTATION_REQUIRED",
+                    "Both required human certifications must be accepted.",
+                )
+            expected_sections = {row.section for row in bid.comparison}
+            if set(payload.answers) != expected_sections or any(
+                not isinstance(answer, str) or not answer.strip() or len(answer.strip()) > 10_000
+                for answer in payload.answers.values()
+            ):
+                raise _http_error(
+                    422,
+                    "REVIEW_REVISION_INVALID",
+                    "Provide one nonempty finalized answer for every RFP requirement.",
+                )
+            resolved_sections = tuple(dict.fromkeys(payload.human_resolved_sections))
+            if any(section not in expected_sections for section in resolved_sections):
+                raise _http_error(
+                    422,
+                    "RESOLUTION_SECTION_INVALID",
+                    "Human-resolved sections must belong to this bid.",
+                )
             if bid.task is None or bid.task.done():
                 bid.status = "manual_intervention"
                 bid.error = "Approval waiter is unavailable; manual intervention required."
                 raise _http_error(409, "BID_WAITER_UNAVAILABLE", bid.error)
+            reviewed_rows: list[ReviewSection] = []
+            overrides: list[str] = []
+            for row in bid.comparison:
+                reviewed_answer = payload.answers[row.section].strip()
+                if reviewed_answer != row.answer:
+                    overrides.append(row.section)
+                reviewed_rows.append(row.model_copy(update={"answer": reviewed_answer}))
+            bid.comparison = tuple(reviewed_rows)
+            bid.human_override_sections = tuple(overrides)
+            bid.human_resolved_sections = resolved_sections
             bid.status = "submitting"
             bid.approval.set()  # Only this POST endpoint may release the submission gate.
         response.status_code = 200 if bid.status == "submitted" else 202
@@ -240,7 +323,11 @@ class HITLManager:
         try:
             await bid.approval.wait()
             async with asyncio.timeout(self._submit_timeout):
-                await bid.submit_action()
+                submitted = await bid.submit_action(
+                    {row.section: row.answer for row in bid.comparison}
+                )
+            if submitted is not True:
+                raise RuntimeError("The submission action did not confirm completion.")
             bid.status = "submitted"
         except asyncio.CancelledError:
             bid.status = "manual_intervention"
@@ -279,7 +366,9 @@ router = manager.router
 _generation_lock = asyncio.Lock()
 
 
-async def _generate_bid(response: Response) -> BidSnapshot:
+async def _generate_bid(
+    response: Response, payload: BidGenerationRequest | None = None
+) -> BidSnapshot:
     """Run one proposal pipeline from the dashboard and return its review state."""
     response.headers["Cache-Control"] = "no-store"
     if _generation_lock.locked():
@@ -295,10 +384,12 @@ async def _generate_bid(response: Response) -> BidSnapshot:
 
     async with _generation_lock:
         try:
-            # Retrieval and section reasoning happen inside the orchestrator;
-            # the reasoner's section calls run concurrently, while this lock
-            # serializes browser staging so one request owns one generated draft.
-            return await run_pipeline()
+            # Retrieval and one token-efficient reasoning batch happen inside
+            # the orchestrator; this lock ensures one request owns browser staging.
+            snapshot = await run_pipeline(payload.source_url if payload else None)
+            if snapshot is None:
+                raise RuntimeError("Dry-run mode did not create a review session.")
+            return snapshot
         except Exception as exc:
             LOGGER.exception("Dashboard bid generation failed")
             raise _http_error(

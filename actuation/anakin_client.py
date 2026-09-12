@@ -27,15 +27,13 @@ CRAWL_TIMEOUT_SECONDS = 120
 MAX_POLLS = 20
 POLL_INTERVAL_SECONDS = 2
 STAGING_TIMEOUT_SECONDS = 180
+BROWSER_SESSION_ATTEMPTS = 2
+BROWSER_SESSION_RETRY_DELAY_SECONDS = 2
 PORTAL_NAVIGATION_ATTEMPTS = 3
 PORTAL_RETRY_DELAY_SECONDS = 1
 PORTAL_PROBE_TIMEOUT_SECONDS = 5
 MAX_FORM_BYTES = 128_000
-FORM_FIELDS = (
-    ("Security", "security", "security"),
-    ("Tech Specs", "tech_specs", "tech-specs"),
-    ("Pricing", "pricing", "pricing"),
-)
+MAX_BID_SECTIONS = 100
 LOGGER = logging.getLogger(__name__)
 
 
@@ -339,23 +337,20 @@ async def _reachable_mock_origin(
 
 
 def _validated_answers(answers: list) -> dict[str, str]:
-    """Accept the reasoner's section/answer objects; selectors are never generated."""
-    expected = {title for title, _, _ in FORM_FIELDS}
+    """Validate a dynamic set of reasoner answers before browser actuation."""
     values: dict[str, str] = {}
-    if not isinstance(answers, list):
+    if not isinstance(answers, list) or not 1 <= len(answers) <= MAX_BID_SECTIONS:
         raise ValueError("answers must be a list of section/answer objects.")
     for item in answers:
         if not isinstance(item, dict) or not isinstance(item.get("section"), str):
             raise ValueError("Each answer must contain a section and an answer string.")
-        title, answer = item["section"], item.get("answer")
-        if title not in expected or title in values:
-            raise ValueError("Provide each mock portal section exactly once.")
+        title, answer = item["section"].strip(), item.get("answer")
+        if not title or len(title) > 256 or title in values:
+            raise ValueError("Each mock portal section must have one unique title.")
         if not isinstance(answer, str) or not 1 <= len(answer.strip()) <= 10_000:
             raise ValueError("Each answer must contain 1 to 10000 characters.")
         # The mock portal strips surrounding whitespace when saving each section.
         values[title] = answer.strip().replace("\r\n", "\n").replace("\r", "\n")
-    if set(values) != expected:
-        raise ValueError("Security, Tech Specs, and Pricing answers are all required.")
     return values
 
 
@@ -393,7 +388,14 @@ class _MockBrowser:
         # Events are serviced while commands wait; there is no background submitter.
         message = await self.websocket.receive()
         if message.type != aiohttp.WSMsgType.TEXT:
-            raise AnakinStageError("The Anakin browser connection closed unexpectedly.")
+            close_code = getattr(self.websocket, "close_code", None)
+            diagnostic = f" (WebSocket type {message.type.name}"
+            if close_code is not None:
+                diagnostic += f", code {close_code}"
+            diagnostic += ")"
+            raise AnakinStageError(
+                "The Anakin browser connection closed unexpectedly" + diagnostic + "."
+            )
         event = json.loads(message.data)
         if not isinstance(event, dict):
             raise AnakinStageError("The browser returned malformed CDP data.")
@@ -452,6 +454,7 @@ class _MockBrowser:
         # Evaluation is sequential; answer text is JSON data inside fixed scripts.
         result = await self.call("Runtime.evaluate", {
             "expression": expression, "returnByValue": True,
+            "awaitPromise": True,
             "timeout": REQUEST_TIMEOUT_SECONDS * 1000,
         })
         if "exceptionDetails" in result or not isinstance(result.get("result"), dict):
@@ -532,56 +535,81 @@ class _MockBrowser:
         body = request.get("postData", "")
         if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_FORM_BYTES:
             raise AnakinStageError("The browser supplied invalid or oversized form data.")
-        if method == "POST" and local_path != "/bids" and not body:
+        if method == "POST" and not body:
             raise AnakinStageError("The browser omitted the form body.")
+        request_content_type = (
+            "application/json"
+            if method == "POST" and local_path == "/api/bids"
+            else "application/x-www-form-urlencoded"
+        )
         try:
             async with self.portal_session.request(
                 method, url, data=body.encode("utf-8") if method == "POST" else None,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={"Content-Type": request_content_type},
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=10),
                 allow_redirects=False,
             ) as response:
                 allowed_get_statuses = {200}
                 if is_browser_asset:
                     allowed_get_statuses.update({301, 302, 303, 307, 308})
-                allowed_statuses = {303} if method == "POST" else allowed_get_statuses
+                allowed_statuses = (
+                    {201}
+                    if method == "POST" and local_path == "/api/bids"
+                    else {303}
+                    if method == "POST"
+                    else allowed_get_statuses
+                )
                 if response.status not in allowed_statuses:
                     raise AnakinStageError(f"The mock portal returned HTTP {response.status}.")
                 content = await response.read()
                 if method == "POST" and is_expected_local_request:
-                    destination = urljoin(url, response.headers.get("Location", ""))
-                    destination_url = urlsplit(destination)
-                    destination_path = (
-                        destination_url.path or "/"
-                        if (
-                            destination_url.scheme == origin.scheme
-                            and (destination_url.hostname or "").lower() in loopback_hosts
-                            and (destination_url.port or (443 if destination_url.scheme == "https" else 80)) == origin_port
-                            and destination_url.username is None
-                            and destination_url.password is None
-                            and destination_url.query == ""
-                            and destination_url.fragment == ""
-                        )
-                        else None
-                    )
-                    if path == "/bids":
-                        match = re.fullmatch(
-                            r"/bids/([0-9a-f]{32})/security", destination_path or ""
-                        )
-                        if not match:
-                            raise AnakinStageError("The mock portal returned an unsafe draft redirect.")
-                        self.bid_id = match[1]
-                        next_path = f"/bids/{self.bid_id}/security"
+                    if path == "/api/bids":
+                        try:
+                            payload = json.loads(content)
+                        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                            raise AnakinStageError(
+                                "The mock portal returned an invalid draft receipt."
+                            ) from exc
+                        portal_id = payload.get("id") if isinstance(payload, dict) else None
+                        if not isinstance(portal_id, str) or not re.fullmatch(r"[0-9a-f]{32}", portal_id):
+                            raise AnakinStageError("The mock portal returned an invalid bid ID.")
+                        self.bid_id = portal_id
+                        self.next_request = ("GET", f"/api/bids/{portal_id}")
                     else:
-                        next_slug = {"security": "tech-specs", "tech-specs": "pricing", "pricing": "submit"}
-                        next_path = f"/bids/{self.bid_id}/{next_slug[path.rsplit('/', 1)[1]]}"
-                    if destination_path != next_path:
-                        raise AnakinStageError("The mock portal redirected outside the next section.")
-                    self.next_request = ("GET", next_path)
+                        destination = urljoin(url, response.headers.get("Location", ""))
+                        destination_url = urlsplit(destination)
+                        destination_path = (
+                            destination_url.path or "/"
+                            if (
+                                destination_url.scheme == origin.scheme
+                                and (destination_url.hostname or "").lower() in loopback_hosts
+                                and (destination_url.port or (443 if destination_url.scheme == "https" else 80)) == origin_port
+                                and destination_url.username is None
+                                and destination_url.password is None
+                                and destination_url.query == ""
+                                and destination_url.fragment == ""
+                            )
+                            else None
+                        )
+                        if path != "/bids":
+                            next_slug = {"security": "tech-specs", "tech-specs": "pricing", "pricing": "submit"}
+                            next_path = f"/bids/{self.bid_id}/{next_slug[path.rsplit('/', 1)[1]]}"
+                        else:
+                            match = re.fullmatch(
+                                r"/bids/([0-9a-f]{32})/security", destination_path or ""
+                            )
+                            if not match:
+                                raise AnakinStageError("The mock portal returned an unsafe draft redirect.")
+                            self.bid_id = match[1]
+                            next_path = f"/bids/{self.bid_id}/security"
+                        if destination_path != next_path:
+                            raise AnakinStageError("The mock portal redirected outside the next section.")
+                        self.next_request = ("GET", next_path)
                 elif method == "GET" and is_expected_local_request:
-                    self.next_request = (
-                        None if path.endswith("/submit") else ("POST", "/bids" if path == "/" else path)
-                    )
+                    if path.endswith("/submit") or path.startswith("/api/bids/"):
+                        self.next_request = None
+                    else:
+                        self.next_request = ("POST", "/api/bids" if path == "/" else path)
                 headers = [
                     {"name": name, "value": value}
                     for name, value in response.headers.items()
@@ -622,49 +650,50 @@ async def _navigate_initial_page(browser: _MockBrowser, origin: str) -> None:
     raise last_error or MockPortalUnavailableError()
 
 
-async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> dict[str, Any]:
-    """Save each known section, then verify the locked review page."""
-    # Saves run in order because each form carries the draft's current revision.
+async def _stage_dynamic_draft(
+    browser: _MockBrowser, answers: dict[str, str]
+) -> dict[str, Any]:
+    """Create and verify a dynamic draft through the browser's local API call."""
+    # Browser actions are sequential: create once, verify once, then disconnect.
     await _navigate_initial_page(browser, browser.origin)
-    await browser.evaluate("""(() => {
-        const button = document.getElementById('start_bid');
-        if (!button || button.disabled || button.form?.getAttribute('action') !== '/bids'
-            || button.form.method !== 'post') throw new Error('Unexpected start form');
-        button.click();
-    })()""")
-    # The first navigation creates the draft; its ID comes only from the checked redirect.
-    async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
-        while browser.bid_id is None:
-            await browser._receive()
-    for title, field_id, slug in FORM_FIELDS:
-        page_url = f"{browser.origin}/bids/{browser.bid_id}/{slug}"
-        await browser.wait_page(page_url)
-        data = json.dumps({"url": page_url, "id": field_id, "title": title, "answer": answers[title]})
-        await browser.evaluate("""((data) => {
-            const field = document.getElementById(data.id);
-            const button = document.getElementById('save_continue');
-            if (location.href !== data.url || !(field instanceof HTMLTextAreaElement)
-                || field.name !== data.title || field.disabled || field.readOnly
-                || !button || button.disabled || button.form !== field.form
-                || field.form.action !== data.url || field.form.method !== 'post')
-                throw new Error('Unexpected section form');
-            field.value = data.answer;
-            if (field.value !== data.answer || !field.form.reportValidity())
-                throw new Error('Invalid answer');
-            button.click();
-        })(""" + data + ")")
+    payload = json.dumps({"answers": answers}, ensure_ascii=False)
+    created = await browser.evaluate("""(async (payload) => {
+        const response = await fetch('/api/bids', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        return {status: response.status, payload: await response.json()};
+    })(""" + payload + ")")
+    created_payload = created.get("payload") if isinstance(created, dict) else None
+    if (
+        not isinstance(created, dict)
+        or created.get("status") != 201
+        or not isinstance(created_payload, dict)
+        or created_payload.get("id") != browser.bid_id
+        or created_payload.get("answers") != answers
+        or created_payload.get("approved") is not False
+        or created_payload.get("submitted") is not False
+    ):
+        raise AnakinStageError("The browser could not verify the newly staged draft.")
+
+    verified = await browser.evaluate("""(async (bidId) => {
+        const response = await fetch(`/api/bids/${bidId}`, {cache: 'no-store'});
+        return {status: response.status, payload: await response.json()};
+    })(""" + json.dumps(browser.bid_id) + ")")
+    verified_payload = verified.get("payload") if isinstance(verified, dict) else None
+    if (
+        not isinstance(verified, dict)
+        or verified.get("status") != 200
+        or not isinstance(verified_payload, dict)
+        or verified_payload.get("id") != browser.bid_id
+        or verified_payload.get("answers") != answers
+        or verified_payload.get("approved") is not False
+        or verified_payload.get("submitted") is not False
+    ):
+        raise AnakinStageError("The staged answers or approval lock could not be verified.")
+
     review_url = f"{browser.origin}/bids/{browser.bid_id}/submit"
-    await browser.wait_page(review_url)
-    expected = json.dumps({f"review_{field}": answers[title] for title, field, _ in FORM_FIELDS})
-    verified = await browser.evaluate("""((expected) => {
-        const submit = document.getElementById('submit_bid');
-        return !!submit && submit.disabled && submit.form.action === location.href
-            && !!document.getElementById('approve_bid')
-            && Object.entries(expected).every(([id, answer]) =>
-                document.getElementById(id)?.textContent === answer);
-    })(""" + expected + ")")
-    if verified is not True:
-        raise AnakinStageError("The saved answers or human approval gate could not be verified.")
     return {
         "bid_id": browser.bid_id, "review_url": review_url,
         "status": "awaiting_approval", "submitted": False,
@@ -672,14 +701,14 @@ async def _fill_mock_forms(browser: _MockBrowser, answers: dict[str, str]) -> di
 
 
 async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") -> dict[str, Any]:
-    """Launch Anakin's browser, fill the local draft, and stop at locked review.
+    """Launch Anakin's browser, stage a dynamic local draft, and stop at review.
 
-    Answers use {"section": "Security" | "Tech Specs" | "Pricing", "answer": str};
+    Answers use {"section": str, "answer": str};
     source_snippet from the reasoner is accepted but never treated as an action.
     The key comes from ANAKIN_API_KEY; an explicit argument must match it.
     portal_url must match the loopback root in MOCK_PORTAL_URL.
 
-    CDP Fetch relays only the next mock form request through a separate local
+    CDP Fetch relays only the expected mock API requests through a separate local
     aiohttp session, so cloud-browser localhost connectivity is unnecessary.
     The server persists each answer. The browser disconnects after verification;
     review_url reopens that draft for a human. This function neither approves
@@ -703,21 +732,67 @@ async def stage_bid(portal_url: str, answers: list, anakin_api_key: str = "") ->
                 aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.DummyCookieJar()) as local,
             ):
                 origin = await _reachable_mock_origin(local, origins)
-                async with api_session.ws_connect(
-                    BROWSER_API_URL, headers={"X-API-Key": key},
-                    timeout=aiohttp.ClientWSTimeout(ws_receive=REQUEST_TIMEOUT_SECONDS, ws_close=5),
-                    max_msg_size=2 * 1024 * 1024,
-                ) as websocket:
-                    browser = _MockBrowser(websocket, local, origin)
-                    target = await browser.call("Target.createTarget", {"url": "about:blank"})
-                    attached = await browser.call("Target.attachToTarget", {
-                        "targetId": target["targetId"], "flatten": True,
-                    })
-                    browser.session_id = attached["sessionId"]
-                    await browser.call("Page.enable")
-                    await browser.call("Page.setLifecycleEventsEnabled", {"enabled": True})
-                    await browser.call("Fetch.enable")
-                    return await _fill_mock_forms(browser, values)
+                last_session_error: AnakinStageError | None = None
+                for attempt in range(1, BROWSER_SESSION_ATTEMPTS + 1):
+                    browser: _MockBrowser | None = None
+                    try:
+                        async with api_session.ws_connect(
+                            BROWSER_API_URL, headers={"X-API-Key": key},
+                            timeout=aiohttp.ClientWSTimeout(
+                                ws_receive=REQUEST_TIMEOUT_SECONDS, ws_close=5
+                            ),
+                            max_msg_size=2 * 1024 * 1024,
+                        ) as websocket:
+                            browser = _MockBrowser(websocket, local, origin)
+                            # Anakin provisions one page with every fresh browser. Reuse
+                            # that page, matching the documented Playwright/Puppeteer flow.
+                            targets = await browser.call("Target.getTargets")
+                            target_infos = targets.get("targetInfos")
+                            page_target = next(
+                                (
+                                    target
+                                    for target in target_infos
+                                    if isinstance(target, dict)
+                                    and target.get("type") == "page"
+                                    and isinstance(target.get("targetId"), str)
+                                ),
+                                None,
+                            ) if isinstance(target_infos, list) else None
+                            if page_target is None:
+                                raise AnakinStageError(
+                                    "Anakin did not provide an initial browser page."
+                                )
+                            attached = await browser.call("Target.attachToTarget", {
+                                "targetId": page_target["targetId"], "flatten": True,
+                            })
+                            browser.session_id = attached["sessionId"]
+                            await browser.call("Page.enable")
+                            await browser.call(
+                                "Page.setLifecycleEventsEnabled", {"enabled": True}
+                            )
+                            await browser.call("Fetch.enable")
+                            return await _stage_dynamic_draft(browser, values)
+                    except AnakinStageError as exc:
+                        # A lost session is safe to retry only before the local portal
+                        # has created a draft. Never replay a partially completed action.
+                        if (
+                            browser is None
+                            or browser.bid_id is not None
+                            or attempt >= BROWSER_SESSION_ATTEMPTS
+                        ):
+                            raise
+                        last_session_error = exc
+                        LOGGER.warning(
+                            "Anakin browser session failed before draft creation; "
+                            "retrying in %ss (attempt %d/%d).",
+                            BROWSER_SESSION_RETRY_DELAY_SECONDS,
+                            attempt,
+                            BROWSER_SESSION_ATTEMPTS,
+                        )
+                        await asyncio.sleep(BROWSER_SESSION_RETRY_DELAY_SECONDS)
+                raise last_session_error or AnakinStageError(
+                    "Anakin browser staging did not complete."
+                )
     except MockPortalUnavailableError:
         raise
     except asyncio.TimeoutError:

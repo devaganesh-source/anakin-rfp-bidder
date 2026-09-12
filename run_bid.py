@@ -13,6 +13,7 @@ import os
 import re
 import time
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,8 +26,8 @@ try:
 except ModuleNotFoundError:  # Keep the script runnable in the minimal project venv.
     requests = httpx
 
+from actuation.anakin_client import crawl_rfp, stage_bid
 from actuation.hitl_manager import BidSnapshot, app as hitl_app, manager
-from crawler import RFPCrawler
 from reasoner.groq_reasoner import process_all_sections
 from reasoner.vector_store import build_index
 from start_backend import ensure_port_available
@@ -36,6 +37,48 @@ COMPLIANCE_MARKDOWN_URL = "https://vercel.com/docs/security/compliance.md"
 STATUS_SUMMARY_URL = "https://www.vercel-status.com/api/v2/summary.json"
 LIVE_FETCH_TIMEOUT_SECONDS = 30
 SUBMIT_TIMEOUT_SECONDS = 30
+
+
+def _normalize_anakin_rfp_sections(
+    crawled_sections: Mapping[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Expand Anakin Markdown headings into individual labelled requirements."""
+    if not crawled_sections:
+        raise RuntimeError("Anakin returned no RFP content.")
+    document_title = "Untitled RFP"
+    requirements: dict[str, str] = {}
+    labelled_requirement = re.compile(
+        r"(?ms)^\s*\*\*(?P<title>[^*\n]+?):\*\*\s*(?P<body>.*?)"
+        r"(?=^\s*\*\*[^*\n]+?:\*\*|\Z)"
+    )
+
+    def clean(value: str) -> str:
+        unescaped = re.sub(r"\\([\\`*_{}\[\]()#+.!-])", r"\1", value)
+        return " ".join(unescaped.split())
+
+    for heading, body in crawled_sections.items():
+        clean_heading = clean(heading)
+        if not body.strip():
+            if document_title == "Untitled RFP" and clean_heading:
+                document_title = clean_heading
+            continue
+        matches = list(labelled_requirement.finditer(body))
+        if matches:
+            for match in matches:
+                title = clean(match.group("title"))
+                requirement = clean(match.group("body"))
+                if not title or not requirement or title in requirements:
+                    raise RuntimeError("Anakin returned duplicate or empty RFP requirements.")
+                requirements[title] = requirement
+        elif clean_heading:
+            requirement = clean(body)
+            if not requirement or clean_heading in requirements:
+                raise RuntimeError("Anakin returned duplicate or empty RFP sections.")
+            requirements[clean_heading] = requirement
+
+    if not requirements:
+        raise RuntimeError("Anakin returned no usable RFP requirements.")
+    return document_title, requirements
 
 
 def _chunk_live_markdown(markdown: str) -> list[str]:
@@ -208,93 +251,74 @@ def _validate_local_service_ports(portal_url: str, hitl_port: int) -> None:
         )
 
 
-async def _stage_bid_via_api(
-    portal_url: str,
-    answers: list[dict[str, str]],
-) -> dict[str, Any]:
-    """Create the local draft through JSON without probing an HTML form."""
-    parsed_portal = urlsplit(portal_url)
-    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
-    if (
-        parsed_portal.scheme not in {"http", "https"}
-        or (parsed_portal.hostname or "").lower() not in loopback_hosts
-        or parsed_portal.username is not None
-        or parsed_portal.password is not None
-        or parsed_portal.path not in {"", "/"}
-        or parsed_portal.query
-        or parsed_portal.fragment
-    ):
-        raise ValueError("MOCK_PORTAL_URL must be a loopback HTTP(S) root URL.")
-
-    answer_map = {item["section"]: item["answer"] for item in answers}
-    create_url = f"{portal_url.rstrip('/')}/api/bids"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
-            follow_redirects=False,
-        ) as client:
-            response = await client.post(create_url, json={"answers": answer_map})
-    except httpx.RequestError as exc:
-        raise RuntimeError("The local mock bid API could not stage the draft.") from exc
-
-    if response.status_code != 201:
-        raise RuntimeError(
-            f"The local mock bid API returned HTTP {response.status_code} while staging."
-        )
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError("The local mock bid API returned an invalid staging response.") from exc
-    portal_bid_id = data.get("id") if isinstance(data, dict) else None
-    if not isinstance(portal_bid_id, str) or len(portal_bid_id) != 32:
-        raise RuntimeError("The local mock bid API returned an invalid bid ID.")
-
-    return {
-        "bid_id": portal_bid_id,
-        "review_url": f"{portal_url.rstrip('/')}/bids/{portal_bid_id}/submit",
-        "status": "awaiting_approval",
-        "submitted": False,
-    }
-
-
-def _make_submit_action(staged_bid: dict[str, Any], _answers: list[dict[str, str]]):
-    """Create the gated callback that verifies the frontend-owned submission."""
+def _make_submit_action(staged_bid: dict[str, Any]):
+    """Create the sole backend-owned action that approves and submits one revision."""
     portal_bid_id = staged_bid["bid_id"]
     review_parts = urlsplit(staged_bid["review_url"])
     portal_url = f"{review_parts.scheme}://{review_parts.netloc}"
 
-    async def submit_action() -> bool:
-        """Verify once, after HITLManager observes explicit human approval."""
-        verify_url = f"{portal_url.rstrip('/')}/api/bids/{portal_bid_id}"
+    async def submit_action(finalized_answers: Mapping[str, str]) -> bool:
+        """Submit once after HITLManager records the reviewed answer revision."""
+        bid_api_url = f"{portal_url.rstrip('/')}/api/bids/{portal_bid_id}"
+        answers = dict(finalized_answers)
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(SUBMIT_TIMEOUT_SECONDS, connect=10),
                 follow_redirects=False,
             ) as client:
-                response = await client.get(verify_url)
+                approval = await client.post(
+                    f"{bid_api_url}/approve",
+                    json={
+                        "answers": answers,
+                        "authorized_representative": True,
+                        "ungrounded_items_acknowledged": True,
+                    },
+                )
+                if approval.status_code != 200:
+                    raise RuntimeError(
+                        f"The mock portal rejected approval with HTTP {approval.status_code}."
+                    )
+                submission = await client.post(
+                    f"{bid_api_url}/submit", json={"answers": answers}
+                )
+                verification = await client.get(bid_api_url)
         except httpx.RequestError as exc:
-            raise RuntimeError("Submission verification request failed.") from exc
+            raise RuntimeError("The controlled mock submission request failed.") from exc
 
         try:
-            data = response.json()
+            submission_data = submission.json()
+            verification_data = verification.json()
         except ValueError as exc:
-            raise RuntimeError("The local mock bid API returned an invalid status response.") from exc
-        if response.status_code != 200 or not isinstance(data, dict) or data.get("submitted") is not True:
-            raise RuntimeError("The Next.js submission was not confirmed by the local mock bid API.")
+            raise RuntimeError("The mock portal returned an invalid submission response.") from exc
+        if (
+            submission.status_code != 200
+            or not isinstance(submission_data, dict)
+            or submission_data.get("submitted") is not True
+            or verification.status_code != 200
+            or not isinstance(verification_data, dict)
+            or verification_data.get("submitted") is not True
+            or verification_data.get("answers") != answers
+        ):
+            raise RuntimeError("The controlled mock submission could not be verified.")
         return True
 
     return submit_action
 
 
-async def run_pipeline() -> BidSnapshot:
+async def run_pipeline(source_url: str | None = None) -> BidSnapshot | None:
     """Build the proposal, stage it, register HITL state, and return its session."""
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env")
-    _, _, portal_url, rfp_source_url = _required_environment()
+    _, anakin_api_key, portal_url, configured_rfp_url = _required_environment()
+    rfp_source_url = source_url.strip() if isinstance(source_url, str) else configured_rfp_url
+    if not rfp_source_url:
+        raise RuntimeError("Provide an RFP source URL.")
 
     # 1. CRAWL THE RFP
-    crawler = RFPCrawler(rfp_source_url)
-    RFP_SECTIONS = await crawler.crawl()
+    print(f"[ANAKIN CRAWL] Reading live RFP: {rfp_source_url}")
+    crawled_sections = await crawl_rfp(rfp_source_url, anakin_api_key)
+    rfp_title, rfp_sections = _normalize_anakin_rfp_sections(crawled_sections)
+    RFP_SECTIONS = rfp_sections
     print(f"DEBUG: Scraped {len(RFP_SECTIONS)} sections from RFP.")
 
     for idx, (title, content) in enumerate(RFP_SECTIONS.items()):
@@ -321,9 +345,9 @@ async def run_pipeline() -> BidSnapshot:
     proposal_answers = [dict(a) for a in answers]
 
     # 4. STAGE AND REGISTER
-    print("DEBUG: Staging the finalized draft through the local mock JSON API...")
-    staged = await _stage_bid_via_api(portal_url, proposal_answers)
-    submit_action = _make_submit_action(staged, proposal_answers)
+    print("[ANAKIN BROWSER] Staging the finalized draft in the controlled mock portal...")
+    staged = await stage_bid(portal_url, proposal_answers, anakin_api_key)
+    submit_action = _make_submit_action(staged)
     
     # Pass the full dynamic requirement payload to the Next.js review UI.
     return await manager.register_staged_bid(
@@ -331,6 +355,10 @@ async def run_pipeline() -> BidSnapshot:
         RFP_SECTIONS,        # Dynamic, unadulterated requirements
         proposal_answers,    # Dynamic, unadulterated answers
         submit_action,
+        rfp_title=rfp_title,
+        rfp_source_url=rfp_source_url,
+        evidence_sources=(COMPLIANCE_MARKDOWN_URL, STATUS_SUMMARY_URL),
+        evidence_fetched_at=live_evidence["fetched_at"],
     )
 
 
