@@ -1,3 +1,9 @@
 ﻿.env
 venv/
 __pycache__/
+.env.local
+*.py[cod]
+.pytest_cache/
+dashboard/.next/
+dashboard/node_modules/
+dashboard/tsconfig.tsbuildinfo

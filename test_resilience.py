@@ -1,17 +1,14 @@
 """Bounded resilience checks for the local RFP bidder.
 
 Run with ``python test_resilience.py``. The 15-run batch uses deterministic
-local doubles for Groq and Anakin by default, so it never spends credentials
-or depends on an external service. Use ``--live`` to run the same batch through
-the configured services. Both modes execute ``run_bid.run_pipeline`` and the
-real HITL registration path. Failure checks call the real parser, crawler, and
-approval handlers. No test approves a batch bid; the batch stops at the human
-approval boundary.
+local doubles for Groq and Anakin, so it never spends credentials or depends on
+an external service. It executes ``run_bid.run_pipeline`` and the real HITL
+registration path. Failure checks call the real parser, crawler, and approval
+handlers. No test approves a batch bid; it stops at the human approval boundary.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -20,6 +17,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from itertools import count
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -39,6 +37,10 @@ BATCH_RUNS = 15
 CHECK_TIMEOUT_SECONDS = 5.0
 LOGGER = logging.getLogger("resilience")
 LOCAL_PORTAL_URL = "http://127.0.0.1:8000"
+TEST_RFP_SECTIONS = {
+    "1.1 Encryption": "Describe encryption controls.",
+    "1.2 Service Health": "Report current service health.",
+}
 
 
 @dataclass
@@ -78,8 +80,8 @@ async def _timed_check(name: str, operation) -> CheckResult:
     return result
 
 
-async def _run_batch(live: bool = False) -> list[CheckResult]:
-    """Run the real orchestrator fifteen times with optional live service edges."""
+async def _run_batch() -> list[CheckResult]:
+    """Run the real orchestrator fifteen times with deterministic service edges."""
     bid_counter = count(1)
 
     async def fake_reasoner(sections, _faiss_index, _chunks):
@@ -94,6 +96,21 @@ async def _run_batch(live: bool = False) -> list[CheckResult]:
             for title in sections
         ]
 
+    async def fake_crawl(_url, _anakin_api_key):
+        return {
+            "Fixture RFP": "",
+            "1\\. Requirements": (
+                "**1.1 Encryption:** Describe encryption controls.\n\n"
+                "**1.2 Service Health:** Report current service health."
+            ),
+        }
+
+    def fake_live_evidence():
+        return {
+            "fetched_at": "2026-09-12T00:00:00+00:00",
+            "live_chunks": ["local capability fixture"],
+        }
+
     async def fake_stage(portal_url, _answers, _anakin_api_key):
         bid_id = f"{next(bid_counter):032x}"
         return {
@@ -103,8 +120,8 @@ async def _run_batch(live: bool = False) -> list[CheckResult]:
             "submitted": False,
         }
 
-    def fake_submit_action(_staged_bid, _answers):
-        async def submit_action() -> bool:
+    def fake_submit_action(_staged_bid):
+        async def submit_action(_finalized_answers) -> bool:
             await asyncio.sleep(0)
             return True
 
@@ -115,18 +132,19 @@ async def _run_batch(live: bool = False) -> list[CheckResult]:
         "GROQ_API_KEY": "resilience-test-key",
         "ANAKIN_API_KEY": "resilience-test-key",
         "MOCK_PORTAL_URL": LOCAL_PORTAL_URL,
+        "RFP_SOURCE_URL": "https://example.com/rfp",
     }
     try:
         with ExitStack() as stack:
-            if not live:
-                stack.enter_context(patch.dict(os.environ, environment))
-                stack.enter_context(
-                    patch.object(run_bid, "load_and_chunk_docs", return_value=["local capability fixture"])
-                )
-                stack.enter_context(patch.object(run_bid, "build_index", return_value=object()))
-                stack.enter_context(patch.object(run_bid, "process_all_sections", new=fake_reasoner))
-                stack.enter_context(patch.object(run_bid, "stage_bid", new=fake_stage))
-                stack.enter_context(patch.object(run_bid, "_make_submit_action", new=fake_submit_action))
+            stack.enter_context(patch.dict(os.environ, environment))
+            stack.enter_context(patch.object(run_bid, "crawl_rfp", new=fake_crawl))
+            stack.enter_context(
+                patch.object(run_bid, "fetch_live_evidence", new=fake_live_evidence)
+            )
+            stack.enter_context(patch.object(run_bid, "build_index", return_value=object()))
+            stack.enter_context(patch.object(run_bid, "process_all_sections", new=fake_reasoner))
+            stack.enter_context(patch.object(run_bid, "stage_bid", new=fake_stage))
+            stack.enter_context(patch.object(run_bid, "_make_submit_action", new=fake_submit_action))
             for iteration in range(1, BATCH_RUNS + 1):
                 name = f"batch iteration {iteration:02d}/{BATCH_RUNS}"
 
@@ -160,13 +178,115 @@ async def _scenario_empty_or_missing_section() -> None:
 
 async def _scenario_malformed_groq_json() -> None:
     """Malformed model JSON must become a typed parser failure, not a crash."""
-    try:
-        groq_reasoner._validate_answer("{not-json", "Security", ["evidence"])
-    except GroqReasonerError as exc:
-        if exc.code != "GROQ_INVALID_JSON" or exc.payload["code"] != exc.code:
-            raise AssertionError(f"Unexpected Groq parsing payload: {exc.payload}") from exc
-    else:
+    result = groq_reasoner._validate_answer("{not-json", "Security", ["evidence"])
+    if not result["answer"].startswith("CAPABILITY_NOT_FOUND"):
         raise AssertionError("Malformed Groq JSON was accepted.")
+
+
+async def _scenario_multi_excerpt_grounding() -> None:
+    """Rendered links and multiple exact excerpts pass; fabrication fails closed."""
+    context = [
+        "Encryption at rest uses AES-256. Data in transit uses **TLS 1.3**. "
+        "More information is available at [security.example.com](https://security.example.com/). "
+        "Customers may enable [Secure Compute (available on Enterprise plans)]"
+        "(/docs/networking/secure-compute)."
+    ]
+    valid = groq_reasoner._validate_answer(
+        json.dumps({
+            "is_supported": True,
+            "evidence_citations": [
+                "Encryption at rest uses AES-256.",
+                "Data in transit uses TLS 1.3.",
+                "More information is available at https://security.example.com/.",
+                "Customers may enable Secure Compute (available on Enterprise plans).",
+            ],
+            "answer": json.dumps({
+                "encryption_at_rest": "AES-256",
+                "encryption_in_transit": "TLS 1.3",
+            }),
+        }),
+        "Encryption",
+        context,
+    )
+    if valid["answer"].startswith("CAPABILITY_NOT_FOUND"):
+        raise AssertionError("Valid multi-excerpt grounding was rejected.")
+    if "{" in valid["answer"] or "Encryption at rest: AES-256" not in valid["answer"]:
+        raise AssertionError("Serialized answer text was not made reviewer-readable.")
+    invalid = groq_reasoner._validate_answer(
+        json.dumps({
+            "is_supported": True,
+            "evidence_citations": ["The service uses quantum encryption."],
+            "answer": "The service uses quantum encryption.",
+        }),
+        "Encryption",
+        context,
+    )
+    if not invalid["answer"].startswith("CAPABILITY_NOT_FOUND"):
+        raise AssertionError("Fabricated evidence passed validation.")
+    subparts = groq_reasoner._requirement_subparts(
+        "Describe penetration testing, static analysis, continuous scanning, and resilience monitoring."
+    )
+    if len(subparts) != 4 or "continuous scanning" not in subparts:
+        raise AssertionError(f"Compound requirement was not decomposed: {subparts!r}")
+    extracted = groq_reasoner._best_source_statement(
+        "continuous cloud security scanning",
+        "Source URL: https://example.com\nSection: Infrastructure\n\n"
+        "Access is controlled. Continuous cloud security scanning and alerting are enabled.",
+    )
+    if extracted != "Continuous cloud security scanning and alerting are enabled.":
+        raise AssertionError(f"Unexpected extractive coverage sentence: {extracted!r}")
+    if groq_reasoner._subpart_is_explicit(
+        "storage separation", "Backups run every two hours and are retained for 30 days."
+    ):
+        raise AssertionError("Missing storage separation was treated as explicit coverage.")
+    if not groq_reasoner._subpart_is_explicit(
+        "storage separation", "Backups are stored separately in a storage service."
+    ):
+        raise AssertionError("Explicit storage separation was not recognized.")
+    if groq_reasoner._subpart_is_explicit(
+        "relevant plan conditions", "BAAs are available to eligible customers."
+    ):
+        raise AssertionError("Vague eligibility was accepted as a specific plan condition.")
+    if not groq_reasoner._subpart_is_explicit(
+        "relevant plan conditions", "BAAs are available to Pro and Enterprise customers."
+    ):
+        raise AssertionError("Explicit Pro and Enterprise eligibility was not recognized.")
+    plan_source = (
+        "Source URL: https://example.com\nSection: HIPAA\n\n"
+        "Pro teams can purchase the HIPAA BAA add-on. "
+        "Enterprise teams can request a BAA or add Secure Compute to their plan."
+    )
+    plan_statement = groq_reasoner._best_source_statement(
+        "any relevant plan conditions", plan_source
+    )
+    if "Pro teams" not in plan_statement or "Enterprise teams" not in plan_statement:
+        raise AssertionError(f"Plan conditions were not fully extracted: {plan_statement!r}")
+    backup_source = (
+        "Source URL: https://example.com\nSection: Data backup\n\n"
+        "Backups are persisted for 30 days and globally replicated. "
+        "Backups are periodically tested by the engineering team."
+    )
+    restored = groq_reasoner._best_source_statement("restoration testing", backup_source)
+    if restored != "Backups are periodically tested by the engineering team.":
+        raise AssertionError(f"Restoration-test evidence was not normalized: {restored!r}")
+    focused_soc = [
+        "Vercel has a SOC 2 Type 2 attestation for Security, Confidentiality, and Availability. "
+        "More information is available at security.vercel.com."
+    ]
+    pruned = groq_reasoner._filter_answer_to_evidence(
+        "Vercel has a SOC 2 Type 2 attestation. Supporting documents are in the ENX TISAX portal.",
+        "Identify the SOC attestation and supporting documentation.",
+        focused_soc,
+    )
+    if "SOC 2 Type 2" not in pruned or "ENX" in pruned or "TISAX" in pruned:
+        raise AssertionError(f"Irrelevant named claim was not removed: {pruned!r}")
+    pruned_encryption = groq_reasoner._filter_answer_to_evidence(
+        "Data at rest uses AES-256. Centralized IAM regulates production access.",
+        "Specify the encryption algorithm and protocol for data at rest and in transit.",
+        ["Data at rest uses AES-256 and data in transit uses TLS 1.3. Centralized IAM is used."],
+    )
+    if "AES-256" not in pruned_encryption or "IAM" in pruned_encryption:
+        raise AssertionError(f"Unrequested control sentence survived: {pruned_encryption!r}")
 
 
 async def _scenario_groq_timeout() -> None:
@@ -203,6 +323,61 @@ async def _scenario_groq_timeout() -> None:
                 raise AssertionError(f"Unexpected timeout payload: {exc.payload}") from exc
         else:
             raise AssertionError("Slow Groq call was not timed out.")
+
+
+async def _scenario_structured_output_retry() -> None:
+    """One Groq constrained-decoding failure is retried, then validated."""
+    calls = 0
+
+    class FlakyCompletions:
+        async def create(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise groq_reasoner.groq.BadRequestError(
+                    "strict schema generation failed",
+                    response=httpx.Response(
+                        400,
+                        request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+                    ),
+                    body={"error": {"code": "json_validate_failed"}},
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=json.dumps({
+                        "is_supported": True,
+                        "evidence_citations": ["Encryption at rest uses AES-256."],
+                        "answer": "Encryption at rest uses AES-256.",
+                    })),
+                )]
+            )
+
+    class FlakyClient:
+        chat = SimpleNamespace(completions=FlakyCompletions())
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    async def no_delay(_seconds):
+        return None
+
+    with (
+        patch.dict(os.environ, {"GROQ_API_KEY": "resilience-test-key"}),
+        patch.object(groq_reasoner, "AsyncGroq", FlakyClient),
+        patch.object(groq_reasoner.asyncio, "sleep", new=no_delay),
+    ):
+        answer = await groq_reasoner.generate_section_answer(
+            "Encryption", "State encryption at rest.", ["Encryption at rest uses AES-256."]
+        )
+    if calls != 2 or answer["answer"].startswith("CAPABILITY_NOT_FOUND"):
+        raise AssertionError("Structured-output retry did not recover exactly once.")
 
 
 async def _scenario_anakin_crawl_404() -> None:
@@ -257,16 +432,20 @@ async def _register_test_bid(manager: HITLManager, submit_action) -> str:
             "status": "awaiting_approval",
             "submitted": False,
         },
-        run_bid.RFP_SECTIONS,
+        TEST_RFP_SECTIONS,
         [
             {
                 "section": title,
                 "answer": "A reviewed local answer.",
                 "source_snippet": "local capability fixture",
             }
-            for title in run_bid.RFP_SECTIONS
+            for title in TEST_RFP_SECTIONS
         ],
         submit_action,
+        rfp_title="Fixture RFP",
+        rfp_source_url="https://example.com/rfp",
+        evidence_sources=("https://example.com/evidence",),
+        evidence_fetched_at="2026-09-12T00:00:00+00:00",
     )
     return next(reversed(manager._bids))
 
@@ -276,7 +455,7 @@ async def _scenario_duplicate_approval() -> None:
     manager = HITLManager(submit_timeout_seconds=1)
     calls = 0
 
-    async def submit_action() -> bool:
+    async def submit_action(_answers) -> bool:
         nonlocal calls
         calls += 1
         await asyncio.sleep(0)
@@ -288,8 +467,16 @@ async def _scenario_duplicate_approval() -> None:
             transport=httpx.ASGITransport(app=_asgi_app(manager)),
             base_url=LOCAL_PORTAL_URL,
         ) as client:
-            first = await client.post(f"/api/bids/{bid_id}/approve")
-            second = await client.post(f"/api/bids/{bid_id}/approve")
+            approval_payload = {
+                "answers": {
+                    title: "A reviewed local answer." for title in TEST_RFP_SECTIONS
+                },
+                "authorized_representative": True,
+                "ungrounded_items_acknowledged": True,
+                "human_resolved_sections": [],
+            }
+            first = await client.post(f"/api/bids/{bid_id}/approve", json=approval_payload)
+            second = await client.post(f"/api/bids/{bid_id}/approve", json=approval_payload)
         if first.status_code != 202:
             raise AssertionError(f"First approval returned HTTP {first.status_code}.")
         if second.status_code != 409 or second.json()["detail"]["code"] != "BID_ALREADY_APPROVED":
@@ -298,33 +485,31 @@ async def _scenario_duplicate_approval() -> None:
         if calls != 1:
             raise AssertionError(f"Submit action ran {calls} times.")
 
-        portal_bid = mock_portal.Bid()
-        portal_bid.answers = {
-            title: "A reviewed local answer." for title, _, _ in mock_portal.SECTIONS.values()
-        }
-        mock_portal.bids[portal_bid.id] = portal_bid
-        try:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=mock_portal.app),
-                base_url=LOCAL_PORTAL_URL,
-            ) as client:
-                first_portal = await client.post(
-                    f"/api/bids/{portal_bid.id}/approve",
-                    data={"token": portal_bid.token, "revision": "0", "confirm": "yes"},
-                )
-                second_portal = await client.post(
-                    f"/api/bids/{portal_bid.id}/approve",
-                    data={"token": portal_bid.token, "revision": "0", "confirm": "yes"},
-                )
-            if first_portal.status_code != 303:
-                raise AssertionError(f"Mock portal first approval returned HTTP {first_portal.status_code}.")
-            if (
-                second_portal.status_code != 409
-                or second_portal.json()["detail"]["code"] != "BID_ALREADY_APPROVED"
-            ):
-                raise AssertionError(f"Mock portal duplicate approval was not rejected: {second_portal.text}")
-        finally:
-            mock_portal.bids.pop(portal_bid.id, None)
+        portal_answers = {"Security": "A reviewed local answer."}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mock_portal.app),
+            base_url=LOCAL_PORTAL_URL,
+        ) as client:
+            created = await client.post("/api/bids", json={"answers": portal_answers})
+            portal_id = created.json()["id"]
+            first_portal = await client.post(
+                f"/api/bids/{portal_id}/approve",
+                json={
+                    "answers": portal_answers,
+                    "authorized_representative": True,
+                    "ungrounded_items_acknowledged": True,
+                },
+            )
+            changed_portal = await client.post(
+                f"/api/bids/{portal_id}/approve",
+                json={
+                    "answers": {"Security": "Changed after approval."},
+                    "authorized_representative": True,
+                    "ungrounded_items_acknowledged": True,
+                },
+            )
+        if first_portal.status_code != 200 or changed_portal.status_code != 409:
+            raise AssertionError((first_portal.text, changed_portal.text))
     finally:
         await manager.aclose()
 
@@ -337,7 +522,15 @@ async def _scenario_approval_before_staging() -> None:
             transport=httpx.ASGITransport(app=_asgi_app(manager)),
             base_url=LOCAL_PORTAL_URL,
         ) as client:
-            response = await client.post("/api/bids/not-staged/approve")
+            response = await client.post(
+                "/api/bids/not-staged/approve",
+                json={
+                    "answers": {"Security": "Reviewed answer."},
+                    "authorized_representative": True,
+                    "ungrounded_items_acknowledged": True,
+                    "human_resolved_sections": [],
+                },
+            )
         if response.status_code != 404 or response.json()["detail"]["code"] != "BID_NOT_READY":
             raise AssertionError(f"Early approval was not rejected: {response.text}")
 
@@ -347,7 +540,11 @@ async def _scenario_approval_before_staging() -> None:
         ) as client:
             portal_response = await client.post(
                 "/api/bids/not-staged/approve",
-                data={"token": "missing", "revision": "0", "confirm": "yes"},
+                json={
+                    "answers": {"Security": "Reviewed answer."},
+                    "authorized_representative": True,
+                    "ungrounded_items_acknowledged": True,
+                },
             )
         if portal_response.status_code != 404 or portal_response.json()["detail"]["code"] != "BID_NOT_READY":
             raise AssertionError(f"Mock portal early approval was not rejected: {portal_response.text}")
@@ -355,26 +552,28 @@ async def _scenario_approval_before_staging() -> None:
         await manager.aclose()
 
 
-async def run_suite(live: bool = False) -> list[CheckResult]:
-    """Run the batch and all six bounded failure scenarios."""
+async def run_suite() -> list[CheckResult]:
+    """Run the batch and all bounded failure scenarios."""
     if not os.environ.get("MOCK_PORTAL_URL"):
         os.environ["MOCK_PORTAL_URL"] = LOCAL_PORTAL_URL
-    results = await _run_batch(live=live)
+    results = await _run_batch()
     scenarios = (
         ("scenario 1: empty or missing RFP section", _scenario_empty_or_missing_section),
         ("scenario 2: malformed Groq JSON", _scenario_malformed_groq_json),
-        ("scenario 3: Groq timeout", _scenario_groq_timeout),
-        ("scenario 4: Anakin crawl 404", _scenario_anakin_crawl_404),
-        ("scenario 5: duplicate approval", _scenario_duplicate_approval),
-        ("scenario 6: approval before staging", _scenario_approval_before_staging),
+        ("scenario 3: multi-excerpt grounding", _scenario_multi_excerpt_grounding),
+        ("scenario 4: Groq timeout", _scenario_groq_timeout),
+        ("scenario 5: strict-output retry", _scenario_structured_output_retry),
+        ("scenario 6: Anakin crawl 404", _scenario_anakin_crawl_404),
+        ("scenario 7: duplicate approval", _scenario_duplicate_approval),
+        ("scenario 8: approval before staging", _scenario_approval_before_staging),
     )
     for name, operation in scenarios:
         results.append(await _timed_check(name, operation))
     return results
 
 
-async def main(live: bool = False) -> int:
-    results = await run_suite(live=live)
+async def main() -> int:
+    results = await run_suite()
     passed = sum(result.status == "PASS" for result in results)
     failed = len(results) - passed
     print(json.dumps({"passed": passed, "failed": failed, "results": [asdict(result) for result in results]}, indent=2))
@@ -382,15 +581,8 @@ async def main(live: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Run the 15 batch iterations through configured Groq and Anakin services.",
-    )
-    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        raise SystemExit(asyncio.run(main(live=args.live)))
+        raise SystemExit(asyncio.run(main()))
     except (KeyboardInterrupt, OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(f"Resilience suite failed to start: {exc}") from exc
