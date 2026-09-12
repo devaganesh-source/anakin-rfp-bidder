@@ -902,7 +902,7 @@ async def process_all_sections(
             FORMATTING_INSTRUCTIONS[0],
             f"bid batch {batch_number}/{batch_count}",
             batch=True,
-            max_completion_tokens=2048,
+            max_completion_tokens=3072,
             reasoning_effort="low",
         )
         try:
