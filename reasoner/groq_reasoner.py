@@ -17,7 +17,7 @@ from reasoner.vector_store import search_index
 
 # This model is available to the configured account and preserves fast,
 # schema-constrained reasoning for the dashboard's section workflow.
-MODEL = "openai/gpt-oss-120b"
+MODEL = "openai/gpt-oss-20b"
 REQUEST_TIMEOUT_SECONDS = 60.0
 MAX_RATE_LIMIT_ATTEMPTS = 3
 FORMATTING_INSTRUCTIONS = [
