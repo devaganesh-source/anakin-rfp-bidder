@@ -2,7 +2,7 @@ services:
   - type: web
     name: anakin-rfp-bidder
     runtime: docker
-    plan: 1c-2g
+    plan: free
     region: singapore
     dockerfilePath: ./Dockerfile
     dockerContext: .
