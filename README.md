@@ -40,7 +40,8 @@ The review binder displays the RFP URL, evidence URLs, and evidence-fetch timest
 
 ## Safety properties
 
-- Browser actuation is restricted to the configured `localhost`/loopback mock portal.
+- Browser actuation is restricted to the configured loopback mock portal. In the
+  deployment image that portal remains private inside the application container.
 - The agent stages a draft but cannot authorize itself.
 - Approval records one exact reviewed answer set; editing it produces a new revision.
 - The backend performs one bounded submission attempt and verifies the resulting portal state.
@@ -79,6 +80,46 @@ npm run dev
 ```
 
 Open <http://127.0.0.1:3000>, confirm or replace the live RFP URL, and select **Generate new bid**.
+
+## Deploy one public hackathon link
+
+The repository includes a multi-stage `Dockerfile` and `render.yaml` Blueprint.
+The image builds the Next.js dashboard as static files and serves them from the
+FastAPI orchestration service, so the dashboard and API share one public origin.
+The controlled mock procurement portal runs on container loopback and is not
+exposed as a second public service.
+
+1. Push the repository to GitHub.
+2. In Render, choose **New → Blueprint** and select the repository.
+3. Review the `1c-2g` compute selection before creating the service. It is a
+   paid 2 GB plan; the 512 MB free instance does not leave safe runtime headroom
+   for PyTorch, FAISS, both FastAPI processes, and the embedding model.
+4. Supply `GROQ_API_KEY` and `ANAKIN_API_KEY` when Render prompts for the two
+   `sync: false` environment variables. Do not commit either value.
+5. Create the Blueprint and wait for `/api/health` to pass.
+6. Open the assigned `https://<service-name>.onrender.com` URL. That URL is both
+   the dashboard and the hackathon submission link.
+
+The host injects `PORT`; `deploy_server.py` binds the public API to it and starts
+exactly one private mock-portal worker on port 8000. The embedding model is cached
+in the image during the build, avoiding a Hugging Face download during a live run.
+Do not set `NEXT_PUBLIC_API_BASE_URL` for this bundled deployment—the dashboard
+uses same-origin `/api` requests. Render's Docker and port requirements are
+documented in [Docker on Render](https://render.com/docs/docker) and
+[Web Services](https://render.com/docs/web-services). Current compute sizes and
+prices are listed on Render's [Compute Plans](https://render.com/docs/compute-plans)
+page. Suspend or delete the service after judging if you no longer need it.
+
+Before sharing the link, verify:
+
+```text
+GET https://<service-name>.onrender.com/api/health
+{"status":"ok","service":"anakin-rfp-bidder"}
+```
+
+Generate only one bid for the recorded path unless the Groq quota has replenished.
+The dashboard prevents concurrent generation, and daily quota exhaustion fails
+closed without staging or submitting a partial bid.
 
 ## Judge demo sequence
 
@@ -125,4 +166,11 @@ Run a credentialed end-to-end demo only when the mock portal is running:
 
 ## Scope and limitations
 
-This is a hackathon-safe procurement demonstration, not a production bidding service. Bid and portal state are intentionally in memory, authentication is not implemented, and final actions target only the bundled local mock portal. Production deployment would require durable encrypted storage, authenticated reviewer identities, audit retention, tenant isolation, and customer-specific evidence connectors.
+This is a hackathon-safe procurement demonstration, not a production bidding
+service. Bid and portal state are intentionally in memory, so a service restart
+invalidates existing review links. Authentication is not implemented, and final
+actions target only the bundled private mock portal. Keep the demo service at one
+instance and do not expose it as a general public utility. A production system
+would require durable encrypted storage, authenticated reviewer identities,
+audit retention, tenant isolation, abuse controls, and customer-specific evidence
+connectors.

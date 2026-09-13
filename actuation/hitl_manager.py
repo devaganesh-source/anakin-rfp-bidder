@@ -25,12 +25,14 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from actuation.anakin_client import _mock_origin
@@ -425,3 +427,20 @@ app.add_api_route(
     status_code=201,
     tags=["HITL"],
 )
+
+
+@app.get("/api/health", include_in_schema=False)
+async def health() -> dict[str, str]:
+    """Confirm that the public orchestration process is accepting requests."""
+    return {"status": "ok", "service": "anakin-rfp-bidder"}
+
+
+# Production images include a static Next.js export. API routes are registered
+# first so the dashboard catch-all can never shadow orchestration or approval.
+DASHBOARD_EXPORT_DIR = Path(__file__).resolve().parents[1] / "dashboard" / "out"
+if DASHBOARD_EXPORT_DIR.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=DASHBOARD_EXPORT_DIR, html=True),
+        name="dashboard",
+    )

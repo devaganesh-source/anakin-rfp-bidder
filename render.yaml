@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: anakin-rfp-bidder
+    runtime: docker
+    plan: 1c-2g
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ANAKIN_API_KEY
+        sync: false
+      - key: RFP_SOURCE_URL
+        value: https://devaganesh-source.github.io/my-static-site/
+      - key: MOCK_PORTAL_URL
+        value: http://127.0.0.1:8000
+      - key: MOCK_PORTAL_PORT
+        value: "8000"

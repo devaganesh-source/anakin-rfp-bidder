@@ -58,7 +58,7 @@ const REQUEST_TIMEOUT_MS = 12000;
 const DEFAULT_RFP_URL = process.env.NEXT_PUBLIC_DEFAULT_RFP_URL
   || "https://devaganesh-source.github.io/my-static-site/";
 const API_BASE_URL = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8001"
+  process.env.NEXT_PUBLIC_API_BASE_URL || ""
 ).replace(/\/$/, "");
 
 const GENERATION_STAGES = [
@@ -114,7 +114,8 @@ function finalizedAnswers(comparison: ReviewSection[]) {
 
 function requestErrorMessage(error: unknown, action: string) {
   if (error instanceof TypeError) {
-    return `Backend unavailable at ${API_BASE_URL}. Start the FastAPI service and try again.`;
+    const backendLocation = API_BASE_URL || "this deployment";
+    return `Backend unavailable at ${backendLocation}. Start the FastAPI service and try again.`;
   }
   if (error instanceof DOMException && error.name === "TimeoutError") {
     return `${action} timed out. Confirm the local services are available and try again.`;

@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.env.local
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+dashboard/node_modules
+dashboard/.env.local
+dashboard/.next
+dashboard/.next-deploy
+dashboard/out
+dashboard/tsconfig.tsbuildinfo
+*.log
