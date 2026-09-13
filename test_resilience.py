@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -28,6 +29,7 @@ from fastapi import Response
 import run_bid
 from actuation.anakin_client import AnakinCrawlError, crawl_rfp
 from actuation.hitl_manager import HITLManager
+from actuation import hitl_manager
 from mock_portal import main as mock_portal
 from reasoner import groq_reasoner
 from reasoner.groq_reasoner import GroqReasonerError, process_all_sections
@@ -111,6 +113,11 @@ async def _run_batch() -> list[CheckResult]:
             "live_chunks": ["local capability fixture"],
         }
 
+    def fake_build_index(_chunks):
+        if threading.current_thread() is threading.main_thread():
+            raise AssertionError("Embedding/index work blocked the API event loop.")
+        return object()
+
     async def fake_stage(portal_url, _answers, _anakin_api_key):
         bid_id = f"{next(bid_counter):032x}"
         return {
@@ -141,7 +148,7 @@ async def _run_batch() -> list[CheckResult]:
             stack.enter_context(
                 patch.object(run_bid, "fetch_live_evidence", new=fake_live_evidence)
             )
-            stack.enter_context(patch.object(run_bid, "build_index", return_value=object()))
+            stack.enter_context(patch.object(run_bid, "build_index", new=fake_build_index))
             stack.enter_context(patch.object(run_bid, "process_all_sections", new=fake_reasoner))
             stack.enter_context(patch.object(run_bid, "stage_bid", new=fake_stage))
             stack.enter_context(patch.object(run_bid, "_make_submit_action", new=fake_submit_action))
@@ -552,6 +559,44 @@ async def _scenario_approval_before_staging() -> None:
         await manager.aclose()
 
 
+async def _scenario_cold_import_health() -> None:
+    """Health and duplicate-generation rejection work during a cold import."""
+    importing = threading.Event()
+    release_import = threading.Event()
+    sentinel = object()
+    loop = asyncio.get_running_loop()
+
+    async def fake_pipeline(_source):
+        if asyncio.get_running_loop() is not loop:
+            raise AssertionError("Pipeline/HITL moved to a different event loop.")
+        return sentinel
+
+    def slow_import(_name):
+        importing.set()
+        if not release_import.wait(timeout=2):
+            raise RuntimeError("Health request could not run during import.")
+        return SimpleNamespace(run_pipeline=fake_pipeline)
+
+    with patch.object(hitl_manager.importlib, "import_module", new=slow_import):
+        generation = asyncio.create_task(hitl_manager._generate_bid(Response()))
+        try:
+            if not await asyncio.to_thread(importing.wait, 1):
+                raise AssertionError("Cold import did not start.")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=hitl_manager.app),
+                base_url=LOCAL_PORTAL_URL,
+            ) as client:
+                health = await asyncio.wait_for(client.get("/api/health"), timeout=0.5)
+                duplicate = await client.post("/api/bids/generate")
+            if health.status_code != 200 or duplicate.status_code != 409:
+                raise AssertionError((health.status_code, duplicate.status_code))
+        finally:
+            release_import.set()
+            result = await generation
+        if result is not sentinel:
+            raise AssertionError("Cold import did not resume the pipeline.")
+
+
 async def run_suite() -> list[CheckResult]:
     """Run the batch and all bounded failure scenarios."""
     if not os.environ.get("MOCK_PORTAL_URL"):
@@ -566,6 +611,7 @@ async def run_suite() -> list[CheckResult]:
         ("scenario 6: Anakin crawl 404", _scenario_anakin_crawl_404),
         ("scenario 7: duplicate approval", _scenario_duplicate_approval),
         ("scenario 8: approval before staging", _scenario_approval_before_staging),
+        ("scenario 9: cold-import health responsiveness", _scenario_cold_import_health),
     )
     for name, operation in scenarios:
         results.append(await _timed_check(name, operation))

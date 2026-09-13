@@ -329,7 +329,9 @@ async def run_pipeline(source_url: str | None = None) -> BidSnapshot | None:
     # The blocking fetches run in one worker thread so the event loop stays
     # responsive; final submission remains blocked by the HITL approval Event.
     chunks = live_evidence["live_chunks"]
-    faiss_index = build_index(chunks)
+    # Model loading and embedding are blocking CPU work. Health checks and
+    # review requests must remain responsive while a bid is being prepared.
+    faiss_index = await asyncio.to_thread(build_index, chunks)
 
     # 3. GENERATE AI ANSWERS IN ONE TOKEN-EFFICIENT BATCH
     items = list(RFP_SECTIONS.items())

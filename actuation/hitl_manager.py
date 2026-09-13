@@ -18,6 +18,7 @@ This trusted local demo has no authentication; state resets on process restart.
 """
 
 import asyncio
+import importlib
 import inspect
 import logging
 import math
@@ -380,15 +381,15 @@ async def _generate_bid(
             "Another bid is already being generated. Wait for it to finish before starting another.",
         )
 
-    # Import lazily to keep the HITL manager reusable without creating an import
-    # cycle: run_bid imports this module for the shared manager instance.
-    from run_bid import run_pipeline
-
     async with _generation_lock:
         try:
+            # Cold ML imports can take longer than the host's health-check
+            # deadline. Keep them off the API loop and inside the generation
+            # lock; run_pipeline itself must use this loop for HITL events.
+            pipeline_module = await asyncio.to_thread(importlib.import_module, "run_bid")
             # Retrieval and one token-efficient reasoning batch happen inside
             # the orchestrator; this lock ensures one request owns browser staging.
-            snapshot = await run_pipeline(payload.source_url if payload else None)
+            snapshot = await pipeline_module.run_pipeline(payload.source_url if payload else None)
             if snapshot is None:
                 raise RuntimeError("Dry-run mode did not create a review session.")
             return snapshot
