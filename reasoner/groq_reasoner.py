@@ -586,13 +586,14 @@ def _validate_answer(
 
 
 def _rate_limit_backoff_seconds(error: groq.RateLimitError, attempt: int) -> float:
-    """Prefer Groq's retry hint and fall back to a bounded linear delay."""
+    """Honor Groq's hint while allowing the rolling TPM bucket to replenish."""
+    minimum_delay = float(20 * (attempt + 1))
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", {})
     retry_after = headers.get("retry-after") if headers else None
     if retry_after is not None:
         try:
-            return max(1.0, min(float(retry_after), 60.0))
+            return max(minimum_delay, min(float(retry_after), 60.0))
         except (TypeError, ValueError):
             pass
 
@@ -604,8 +605,8 @@ def _rate_limit_backoff_seconds(error: groq.RateLimitError, attempt: int) -> flo
     if match:
         minutes = float(match.group(1) or 0)
         seconds = float(match.group(2) or 0)
-        return max(1.0, min(minutes * 60 + seconds, 60.0))
-    return float(15 * (attempt + 1))
+        return max(minimum_delay, min(minutes * 60 + seconds, 60.0))
+    return minimum_delay
 
 
 def _is_daily_token_limit(error: groq.RateLimitError) -> bool:
