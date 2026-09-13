@@ -18,3 +18,5 @@ services:
         value: http://127.0.0.1:8000
       - key: MOCK_PORTAL_PORT
         value: "8000"
+      - key: RFP_LIGHTWEIGHT_RETRIEVAL
+        value: "true"

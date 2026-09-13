@@ -1,67 +1,141 @@
-"""Vector store management and semantic chunk retrieval using FAISS and SentenceTransformers."""
+"""Grounded chunk retrieval with a low-memory Render fallback."""
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
-import faiss
-from sentence_transformers import SentenceTransformer
+from typing import Any
 
-# Lightweight embedding model
+
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-_model = None
+_model: Any | None = None
+
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+    "with",
+}
 
 
-def get_embedding_model() -> SentenceTransformer:
-    """Singleton pattern to load the embedding model once."""
+def _lightweight_enabled() -> bool:
+    return os.environ.get(
+        "RFP_LIGHTWEIGHT_RETRIEVAL", ""
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _terms(text: str) -> set[str]:
+    return {
+        token
+        for token in _TOKEN_RE.findall(text.lower())
+        if token not in _STOPWORDS and len(token) > 1
+    }
+
+
+def get_embedding_model() -> Any:
+    """Load the normal semantic model only for local runs."""
     global _model
+
     if _model is None:
+        from sentence_transformers import SentenceTransformer
+
         _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
     return _model
 
 
 def load_and_chunk_docs(sample_data_dir: Path) -> list[str]:
-    """Load all .txt and .md files from sample-data and split them into semantic chunks."""
+    """Load text and markdown documents into evidence chunks."""
     chunks: list[str] = []
-    
-    # Ingest both text and markdown documentation files
-    file_patterns = ["*.txt", "*.md"]
-    for pattern in file_patterns:
+
+    for pattern in ("*.txt", "*.md"):
         for file_path in sample_data_dir.glob(pattern):
             if file_path.is_file():
                 content = file_path.read_text(encoding="utf-8")
-                # Split content into paragraph blocks for granular retrieval
-                paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-                if paragraphs:
-                    chunks.extend(paragraphs)
-                elif content.strip():
-                    chunks.append(content.strip())
-                    
-    # Replace with a fatal error:
+                paragraphs = [
+                    paragraph.strip()
+                    for paragraph in content.split("\n\n")
+                    if paragraph.strip()
+                ]
+                chunks.extend(
+                    paragraphs
+                    or ([content.strip()] if content.strip() else [])
+                )
+
     if not chunks:
-        raise RuntimeError("FATAL: Knowledge base is empty. Add .txt or .md files to sample-data/ to proceed.")
-        
+        raise RuntimeError("Knowledge base is empty.")
+
     return chunks
 
 
-def build_index(chunks: list[str]) -> faiss.IndexFlatIP:
-    """Build a normalized FAISS inner-product index from document chunks."""
+def build_index(chunks: list[str]) -> Any:
+    """Use lexical retrieval on Render Free, semantic FAISS locally."""
+    if _lightweight_enabled():
+        return None
+
+    import faiss
+
     model = get_embedding_model()
     embeddings = model.encode(chunks, normalize_embeddings=True)
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
+
     return index
 
 
-def search_index(query: str, index: faiss.IndexFlatIP, chunks: list[str], top_k: int = 3) -> list[str]:
-    """Retrieve the top-k most relevant text chunks for a given query string."""
+def search_index(
+    query: str,
+    index: Any,
+    chunks: list[str],
+    top_k: int = 3,
+) -> list[str]:
+    """Retrieve grounded chunks using the configured retrieval path."""
+    if index is None:
+        query_terms = _terms(query)
+
+        ranked = sorted(
+            enumerate(chunks),
+            key=lambda item: (
+                len(query_terms & _terms(item[1])),
+                -item[0],
+            ),
+            reverse=True,
+        )
+
+        return [chunk for _, chunk in ranked[:top_k]]
+
     model = get_embedding_model()
-    query_embedding = model.encode([query], normalize_embeddings=True)
-    scores, indices = index.search(query_embedding, top_k)
-    
-    results: list[str] = []
-    for idx in indices[0]:
-        if 0 <= idx < len(chunks):
-            results.append(chunks[idx])
-            
-    return results
+    query_embedding = model.encode(
+        [query],
+        normalize_embeddings=True,
+    )
+    _, indices = index.search(query_embedding, top_k)
+
+    return [
+        chunks[index]
+        for index in indices[0]
+        if 0 <= index < len(chunks)
+    ]

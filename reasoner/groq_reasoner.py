@@ -5,9 +5,10 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
-from typing import TypedDict
+from typing import Any, TypedDict
 
-import faiss
+# Previous implementation retained for reference:
+# import faiss
 import groq
 from groq import APIError, APIStatusError, APITimeoutError, AsyncGroq
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -757,7 +758,9 @@ async def generate_section_answer(
 
 async def process_all_sections(
     sections_dict: Mapping[str, str],
-    faiss_index: faiss.IndexFlatIP,
+    # Previous implementation:
+    # faiss_index: faiss.IndexFlatIP,
+    faiss_index: Any,
     chunks: Sequence[str],
 ) -> list[SectionAnswer]:
     """Retrieve evidence and generate answers in the input's iteration order."""
